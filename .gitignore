@@ -1,0 +1,23 @@
+tasks.md
+.state.json
+.notify.log
+__pycache__/
+.DS_Store
+next.html
+pub-plan/
+.plan-key
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+
+# generated graph
+graphify-out/
+.plan-url
+inbox.md
+.check.json
+.check.log
+.ruff_cache/

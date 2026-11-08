@@ -1,0 +1,10 @@
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+include = ["tyat", "tests/*.py"]
+
+[tool.ruff.lint]
+# Explicit rule set, so a new ruff release can't turn CI red with new defaults.
+select = ["E4", "E7", "E9", "F", "W", "B", "RUF059"]
+# tyat is written in a deliberately compact one-statement-per-branch style.
+ignore = ["E701", "E702"]

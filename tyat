@@ -1,0 +1,1875 @@
+#!/usr/bin/env python3
+"""tend-your-agent-task (tyat) 🌱 — tend your tasks and your agent sessions.  (command: tyat, alias t)
+
+  t                     board + ▶ NEXT recommendation; enter does it
+  t now                 just do the top recommendation (jump to waiting session / start the due task)
+  t add <text> [@folder] [when] [!|!!|!!!] [est:20m] [reach:1-5]   capture (when: today|tomorrow|mon..sun|14:00|2h|3d|2026-11-02|02.11.)
+  t go <id> [assistant] start/resume the task's session in its folder; `?` = show the chooser
+                        assistant: claude | codex | kit:<name> | gemini | grok   (--new = fresh session)
+  t open [name]         fuzzy-pick a project folder → cd + start or resume a session there
+  t recent              fuzzy-pick a recent conversation → cd + resume it (or jump if it is live)
+  t handoffs [days]     where every project stands: newest HANDOFF*.md per project + its next step
+  t page                HTML "what next" page: tasks + publishing calendar ranked by value ÷ effort,
+                        split into a prep block and a do block learned from your own active hours
+  t page --publish      + phone plan (PWA, German voice briefing per block) → wrangler deploy behind the key guard
+                        [--no-voice] [--no-deploy]; folder: $TYAT_PLAN (default ./pub-plan)
+                        task tokens it reads: est:20m|2h (effort)  reach:1-5 (how many people it moves)
+  t report              today since 05:00: done, overdue, due ≤24h, prompts after the stop (also on the phone plan)
+  t inbox [--claude]    fetch feedback recorded or typed on the phone plan, transcribe, append to inbox.md;
+                        --claude opens a session that turns it into t done/next/snooze/add
+  t me [<id> 1|0]       steps only you can do (send, post, call, approve, pay …); 1|0 overrides the guess
+                        (task token me:1|me:0; on the phone plan: the 👤 filter)
+  t fix <id> [0]        fixed appointment: t check never moves it, asks if it happened (0 = movable again)
+  t dl <id> <when>|-    real deadline: no move or slot may pass it (due is just the planned slot)
+  t sync                apply ticks from the phone plan: ticked task → done, unticked → reopened
+                        (the notifier does this every 2 min; TYAT_TICKSYNC=0 turns it off)
+  t check [--apply]     a small model (TYAT_SLM, default claude:haiku) reads commits, handoffs and session
+                        transcripts of the last 72h → which tasks are done; late tasks move into free slots.
+                        --apply writes it (log: .check.log); TYAT_AUTOCHECK=1: notifier runs it at 22:00, 12:00, stop
+  t <n>                 jump to session n (brings its iTerm tab to front)
+  t done <id>           finish            t next <id> <text>   set next step
+  t snooze <id> <when>  push due          t rm <id>            delete
+  t edit                open tasks.md     t notify             one notification pass (LaunchAgent)
+  t help / t --version
+  t install             link `t` into ~/.local/bin + install the notifier LaunchAgent
+"""
+import datetime as dt
+import hashlib
+import html
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import uuid
+from pathlib import Path
+
+__version__ = "0.1.0"
+HOME = Path.home()
+APP = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("TYAT_ROOT", HOME / "claude-projects")).expanduser()
+TASKS = Path(os.environ.get("TYAT_TASKS", APP / "tasks.md")).expanduser()
+STATE = APP / ".state.json"
+SESS_DIR = HOME / ".claude" / "sessions"
+HIST = HOME / ".claude" / "history.jsonl"
+KIT = shutil.which("kit") or str(ROOT / "products/kogitsune/bin/kit")
+RESERVED = set("noqrsx")  # board shortcuts, never used as task ids
+WAIT_ALERT_MIN = int(os.environ.get("TYAT_WAIT_MIN", 10))
+OTHER_AGENTS = {"codex", "grok", "gemini", "cursor-agent", "droid", "agy"}
+
+C = sys.stdout.isatty()
+def col(code, s): return f"\033[{code}m{s}\033[0m" if C else s
+red, yel, grn, dim, bold, cyan = (lambda s, c=c: col(c, s) for c in ("31", "33", "32", "2", "1", "36"))
+
+now = dt.datetime.now().replace(second=0, microsecond=0)
+
+# ── tasks file ────────────────────────────────────────────────────────────────
+# - [ ] Review stars report @products/github-stars-analyzer due:2026-10-27T14:00 id:b via:claude sid:<uuid>
+#   > next: check top 20 candidates
+LINE = re.compile(r"^- \[( |x)\] (.*)$")
+TOKEN = re.compile(r"(?:^|\s)(@\S+|(?:due|id|via|sid|done|pri|est|reach|me|fix|dl):\S+)")
+
+
+class Task:
+    def __init__(self, done, body):
+        self.done, self.notes, self.f = done, [], {}
+        for tok in TOKEN.findall(body):
+            if tok.startswith("@"): self.f["at"] = tok[1:]
+            else:
+                k, v = tok.split(":", 1); self.f[k] = v
+        self.text = TOKEN.sub("", body).strip()
+
+    @property
+    def id(self): return self.f.get("id", "?")
+    @property
+    def due(self):
+        try: return dt.datetime.fromisoformat(self.f["due"])
+        except (KeyError, ValueError): return None
+    @property
+    def pri(self):
+        try: return int(self.f.get("pri", 0))
+        except ValueError: return 0
+    @property
+    def next(self):
+        for n in reversed(self.notes):
+            if n.startswith("next:"): return n[5:].strip()
+
+    def line(self):
+        parts = [f"- [{'x' if self.done else ' '}] {self.text}"]
+        if "at" in self.f: parts.append("@" + self.f["at"])
+        parts += [f"{k}:{self.f[k]}" for k in ("due", "dl", "pri", "est", "reach", "me", "fix", "id", "via", "sid", "done") if k in self.f]
+        return " ".join(parts) + "".join(f"\n  > {n}" for n in self.notes)
+
+
+def load():
+    head, tasks = [], []
+    if TASKS.exists():
+        for raw in TASKS.read_text().splitlines():
+            m = LINE.match(raw)
+            if m: tasks.append(Task(m[1] == "x", m[2]))
+            elif raw.startswith("  > ") and tasks: tasks[-1].notes.append(raw[4:])
+            elif not tasks: head.append(raw)
+    return head or ["# Tasks", "", "<!-- edited by `t`; hand edits welcome, one task per line -->", ""], tasks
+
+
+def save(head, tasks):
+    open_ = [t for t in tasks if not t.done]
+    closed = [t for t in tasks if t.done][-200:]
+    tmp = TASKS.with_name(TASKS.name + ".tmp")  # write-then-rename: a crash never leaves a half-written file
+    tmp.write_text("\n".join(head + [t.line() for t in open_ + closed]) + "\n")
+    os.replace(tmp, TASKS)
+
+
+def find(tasks, tid):
+    for t in tasks:
+        if t.id == tid and not t.done: return t
+    sys.exit(f"no open task '{tid}'")
+
+
+def new_id(tasks):
+    """Lowest free id. Ids finished today stay taken, so "af is done" never names a brand-new af the same evening."""
+    used = {t.id for t in tasks if not t.done or t.f.get("done", "").startswith(now.date().isoformat())}
+    n = 0
+    while True:
+        s, k = "", n
+        while True:
+            s = chr(97 + k % 26) + s; k = k // 26 - 1
+            if k < 0: break
+        if s not in used and s not in RESERVED: return s
+        n += 1
+
+
+def state():
+    try: return json.loads(STATE.read_text())
+    except (OSError, ValueError): return {}
+
+
+# ── time parsing ──────────────────────────────────────────────────────────────
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def parse_when(words):
+    """Consume time words from a token list. Returns (datetime|None, leftover words)."""
+    try: return _parse_when(words)
+    except ValueError as e: sys.exit(f"t: invalid date/time in {' '.join(words)!r}: {e}")
+
+
+def _parse_when(words):
+    day, hm, rel, rest = None, None, None, []
+    for w in words:
+        lw = w.lower().rstrip(",")
+        if lw in ("today", "heute"): day = now.date()
+        elif lw in ("tomorrow", "tmrw", "morgen"): day = now.date() + dt.timedelta(1)
+        elif lw in ("tonight", "abends"): day, hm = now.date(), (19, 0)
+        elif lw[:3] in DAYS and lw in (lw[:3], DAYS_FULL[lw[:3]]):
+            idx = DAYS.index(lw[:3])
+            day = now.date() + dt.timedelta((idx - now.weekday() - 1) % 7 + 1)
+        elif m := re.fullmatch(r"\+?(\d+)(m|min|h|d|w)", lw):
+            n, u = int(m[1]), m[2]
+            rel = {"m": dt.timedelta(minutes=n), "min": dt.timedelta(minutes=n), "h": dt.timedelta(hours=n),
+                   "d": dt.timedelta(days=n), "w": dt.timedelta(weeks=n)}[u]
+        elif m := re.fullmatch(r"(\d{1,2})[:.](\d{2})(h|uhr)?", lw): hm = (int(m[1]), int(m[2]))
+        elif m := re.fullmatch(r"(\d{1,2})(am|pm|h|uhr)", lw):
+            h = int(m[1]) % 12 + (12 if m[2] == "pm" else 0) if m[2] in ("am", "pm") else int(m[1]); hm = (h, 0)
+        elif m := re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", lw): day = dt.date(int(m[1]), int(m[2]), int(m[3]))
+        elif m := re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})?", lw):
+            d = dt.date(int(m[3] or now.year), int(m[2]), int(m[1]))
+            day = d if d >= now.date() or m[3] else d.replace(year=now.year + 1)
+        else: rest.append(w)
+    if rel:
+        base = now + rel
+        if not hm and rel >= dt.timedelta(days=1): hm = (9, 0)
+        return (base.replace(hour=hm[0], minute=hm[1]) if hm else base), rest
+    if day is None and hm is None: return None, rest
+    if day is None:
+        day = now.date()
+        if dt.datetime.combine(day, dt.time(*hm)) <= now: day += dt.timedelta(1)
+    return dt.datetime.combine(day, dt.time(*(hm or (9, 0)))), rest
+
+
+DAYS_FULL = dict(zip(DAYS, ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"], strict=True))
+
+
+def fmt_due(d):
+    if d is None: return dim("later")
+    delta = d - now
+    if delta.total_seconds() < 0:
+        late = -delta
+        s = f"{late.days}d" if late.days else f"{late.seconds // 3600}h" if late.seconds >= 3600 else f"{late.seconds // 60}m"
+        return red(f"⚠ {s} late")
+    if d.date() == now.date(): return yel(d.strftime("%H:%M"))
+    if d.date() == now.date() + dt.timedelta(1): return d.strftime("tmrw %H:%M")
+    if delta.days < 6: return d.strftime("%a %H:%M")
+    return d.strftime("%d %b")
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+def pad(s, n, right=False):
+    gap = " " * max(0, n - len(ANSI.sub("", s)))
+    return gap + s if right else s + gap
+
+
+def ago(secs):
+    secs = max(0, int(secs))
+    if secs < 60: return f"{secs}s"
+    if secs < 3600: return f"{secs // 60}m"
+    if secs < 86400: return f"{secs // 3600}h{secs % 3600 // 60:02d}"
+    return f"{secs // 86400}d"
+
+
+# ── folders ───────────────────────────────────────────────────────────────────
+def short(p):
+    p = Path(p)
+    try: return str(p.relative_to(ROOT))
+    except ValueError: return str(p).replace(str(HOME), "~", 1)
+
+
+def clip_at(at):
+    parts = at.split("/")
+    return at if len(at) <= 40 or len(parts) <= 2 else "…/" + "/".join(parts[-2:])
+
+
+def resolve_dir(at):
+    if not at: return None
+    p = Path(os.path.expanduser(at))
+    return p if p.is_absolute() else ROOT / p
+
+
+# ── live sessions ─────────────────────────────────────────────────────────────
+def alive(pid):
+    try: os.kill(pid, 0); return True
+    except ProcessLookupError: return False
+    except PermissionError: return True
+
+
+def sessions():
+    out, nowms = [], dt.datetime.now().timestamp() * 1000
+    for f in SESS_DIR.glob("*.json"):
+        try: s = json.loads(f.read_text())
+        except (OSError, ValueError): continue
+        if s.get("kind") != "interactive" or not alive(s.get("pid", 0)): continue
+        if "/.claude-mem/" in s.get("cwd", ""): continue
+        st = s.get("status", "?")
+        since = (nowms - s.get("statusUpdatedAt", s.get("startedAt", nowms))) / 1000
+        out.append(dict(pid=s["pid"], who="claude", cwd=s.get("cwd", ""), status=st, since=since,
+                        sid=s.get("sessionId"), name=s.get("name", ""), changed=s.get("statusUpdatedAt")))
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,args="], capture_output=True, text=True).stdout
+    except OSError: ps = ""
+    found = {}
+    for row in ps.splitlines():
+        parts = row.split(None, 3)
+        if len(parts) < 4: continue
+        pid, ppid, etime, args = int(parts[0]), int(parts[1]), parts[2], parts[3]
+        argv = args.split()
+        names = [os.path.basename(a) for a in argv[:2]]
+        who = next((n for n in names if n in OTHER_AGENTS), None)
+        if not who or (argv[1:2] and argv[1] in ("exec", "e", "app-server", "mcp", "login")): continue
+        found[pid] = dict(pid=pid, ppid=ppid, who=who, etime=etime)
+    found = {p: v for p, v in found.items() if v["ppid"] not in found}  # drop wrapper→binary children
+    if found:
+        lo = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, found))],
+                            capture_output=True, text=True).stdout
+        cur = None
+        for ln in lo.splitlines():
+            if ln.startswith("p"): cur = int(ln[1:])
+            elif ln.startswith("n") and cur in found: found[cur]["cwd"] = ln[1:]
+        for v in found.values():
+            out.append(dict(pid=v["pid"], who=v["who"], cwd=v.get("cwd", "?"), status="running",
+                            since=etime_secs(v["etime"]), sid=None, name=""))
+    return out
+
+
+def etime_secs(e):
+    d, _, rest = e.rpartition("-")
+    nums = [int(x) for x in rest.split(":")]
+    while len(nums) < 3: nums.insert(0, 0)
+    return int(d or 0) * 86400 + nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+ON_YOU = {"waiting": "needs you", "idle": "your turn"}
+
+
+def ordered_sessions():
+    ss = sessions()
+    rank = {"waiting": 0, "idle": 1}
+    return sorted(ss, key=lambda s: (rank.get(s["status"], 2), -s["since"] if s["status"] in rank else s["since"]))
+
+
+# ── board ─────────────────────────────────────────────────────────────────────
+def board(filter_dir=None):
+    _, tasks = load()
+    ss = ordered_sessions()
+    by_sid = {t.f["sid"]: t for t in tasks if not t.done and "sid" in t.f}
+    live_sids = {s["sid"] for s in ss if s["sid"]}
+    if filter_dir:
+        ss = [s for s in ss if s["cwd"].startswith(str(filter_dir))]
+    waiting = [s for s in ss if s["status"] in ON_YOU]
+    running = [s for s in ss if s["status"] not in ON_YOU]
+
+    def srow(i, s):
+        t = by_sid.get(s["sid"])
+        tag = cyan(f" [{t.id}] {t.text[:40]}") if t else ""
+        st = s["status"]
+        label = (red if st == "waiting" else yel if st == "idle" else grn)(f"{ON_YOU.get(st, st):<9}")
+        print(f"  {pad(bold(str(i)), 3, True)}  {s['who']:<7} {short(s['cwd'])[:44]:<44} {label} {ago(s['since']):>5}{tag}")
+
+    i = 0
+    if waiting:
+        print(bold("⏳ ON YOU"))
+        for s in waiting: i += 1; srow(i, s)
+    if running:
+        print(bold("🔄 RUNNING"))
+        for s in running: i += 1; srow(i, s)
+    if not ss: print(dim("no agent sessions running"))
+
+    open_ = [t for t in tasks if not t.done]
+    if filter_dir:
+        open_ = [t for t in open_ if resolve_dir(t.f.get("at")) and str(resolve_dir(t.f["at"])).startswith(str(filter_dir))]
+    far = dt.datetime.max
+    open_.sort(key=lambda t: (t.due or far, -t.pri, t.id))
+    print(bold("📋 TASKS") + dim(f"  ({len(open_)} open)"))
+    if not open_: print(dim("  nothing — capture with: t add <text> @folder tomorrow 10:00"))
+    limit = max(15, sum(1 for t in open_ if t.due and t.due <= now))
+    shown = 0
+    for t in open_[:limit]:
+        shown += 1
+        sess = ""
+        if t.f.get("sid") in live_sids: sess = grn(" ● live")
+        elif "sid" in t.f: sess = dim(" ↺ resumable")
+        mark = red("!" * t.pri) + " " if t.pri else ""
+        print(f"  {pad(bold(t.id), 3, True)}  {pad(fmt_due(t.due), 10)} {pad(mark + t.text[:46 - t.pri], 46)} {dim('@' + clip_at(t.f['at'])) if 'at' in t.f else ''}{sess}")
+        if t.next: print(f"       {dim('→ ' + t.next[:90])}")
+    if shown < len(open_): print(dim(f"  … {len(open_) - shown} more (t edit)"))
+    return ss
+
+
+def recommend(tasks, ss):
+    """Everything worth doing now, best first: (rank, label, action)."""
+    recs = []
+    linked = {t.f["sid"]: t for t in tasks if not t.done and "sid" in t.f}
+    for i, s in enumerate(ss, 1):
+        t = linked.get(s["sid"])
+        what = f"[{t.id}] {t.text}" if t else short(s["cwd"])
+        if s["status"] == "waiting":
+            recs.append(((0, -s["since"]), f"answer {s['who']} · {what} {red('needs you ' + ago(s['since']))}", ("jump", i)))
+        elif s["status"] == "idle":
+            recs.append(((2 if t else 4, -s["since"]), f"continue {s['who']} · {what} {yel('your turn ' + ago(s['since']))}", ("jump", i)))
+    live = {s["sid"] for s in ss if s["sid"]}
+    for t in tasks:
+        if t.done or t.f.get("sid") in live: continue
+        where = dim(" @" + t.f["at"]) if "at" in t.f else ""
+        if t.due and t.due <= now: rank = (1, -t.pri, t.due.timestamp())
+        elif t.due and t.due <= now + dt.timedelta(hours=3): rank = (3, t.due.timestamp(), 0)
+        elif t.due is None and t.pri: rank = (5, -t.pri, 0)
+        elif t.due and t.due.date() == now.date(): rank = (6, t.due.timestamp(), 0)
+        elif t.due is None: rank = (7, 0, 0)
+        else: continue
+        recs.append((rank, f"start [{t.id}] {t.text} {fmt_due(t.due)}{where}", ("go", t.id)))
+    recs.sort(key=lambda r: r[0])
+    return recs
+
+
+def do(action, ss):
+    kind, arg = action
+    return jump(ss, arg) if kind == "jump" else go(arg, [])
+
+
+def now_cmd():
+    _, tasks = load()
+    ss = ordered_sessions()
+    recs = recommend(tasks, ss)
+    if not recs: return print("nothing to do — inbox zero 🎉")
+    print(bold("▶ ") + recs[0][1])
+    do(recs[0][2], ss)
+
+
+def interactive():
+    ss = board()
+    _, tasks = load()
+    recs = recommend(tasks, ss)
+    if recs:
+        print("\n" + bold("▶ NEXT  ") + recs[0][1])
+        for r in recs[1:3]: print(dim("  then  ") + r[1])
+    if not sys.stdin.isatty(): return
+    print(dim("\n  ⏎ do next · 1-9 jump · a-z start task · o open folder · r recent · + add · x a done · s a 2h · q quit"))
+    try: cmd = input("› ").strip()
+    except (EOFError, KeyboardInterrupt): print(); return
+    if cmd == "q": return
+    if not cmd: return do(recs[0][2], ss) if recs else None
+    if cmd.startswith("+"): return main(["add"] + cmd[1:].split())
+    if cmd in ("o", "r") or cmd.split()[0] in ("o", "r"):
+        return main([{"o": "open", "r": "recent"}[cmd.split()[0]]] + cmd.split()[1:])
+    if cmd.isdigit(): return jump(ss, int(cmd))
+    parts = cmd.split()
+    alias = {"x": "done", "s": "snooze", "n": "next"}
+    if parts[0] in alias: return main([alias[parts[0]]] + parts[1:])
+    if re.fullmatch(r"[a-z]{1,2}", parts[0]) and parts[0] not in COMMANDS: return main(["go"] + parts)
+    main(parts)
+
+
+# ── actions ───────────────────────────────────────────────────────────────────
+def jump(ss, n):
+    if not 1 <= n <= len(ss): sys.exit(f"no session {n}")
+    s = ss[n - 1]
+    tty = subprocess.run(["ps", "-o", "tty=", "-p", str(s["pid"])], capture_output=True, text=True).stdout.strip()
+    script = f'''tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s is "/dev/{tty}" then
+          select w
+          tell t to select
+          tell s to select
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell'''
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True) if tty and tty != "??" else None
+    if r and r.stdout.strip() == "ok": return
+    print(f"{s['who']} pid {s['pid']} · tty {tty or '?'} · {s['cwd']}")
+    print(dim("couldn't focus the tab (not an iTerm tab, or inside herdr) — cwd above"))
+
+
+def go(tid, rest):
+    head, tasks = load()
+    t = find(tasks, tid)
+    fresh = "--new" in rest
+    ask = "?" in rest
+    rest = [r for r in rest if r not in ("--new", "?")]
+    folder = resolve_dir(t.f.get("at")) or Path.cwd()
+    if not folder.is_dir(): sys.exit(f"folder missing: {folder}  (fix @path with t edit)")
+
+    sid = t.f.get("sid")
+    if sid and not fresh:
+        ss = ordered_sessions()
+        live = [i for i, s in enumerate(ss, 1) if s["sid"] == sid]
+        if live:
+            print(f"task {tid} already has a live session — jumping")
+            return jump(ss, live[0])
+    if rest: via, resume = rest[0], None
+    elif sid and not fresh and not ask and session_exists(sid): via, resume = t.f.get("via", "claude"), sid
+    else:
+        via, resume = choose(folder, t.text, preferred=None if ask else t.f.get("via"), task=t)
+        if via is None: return
+
+    notes = "\n".join(t.notes)
+    ho = latest_handoff(folder)
+    prompt = (f"Task [{tid}]: {t.text}\n" + (f"Notes:\n{notes}\n" if notes else "") +
+              (f"Latest handoff: {ho} — read it first.\n" if ho else "") +
+              f"\nWhen you stop — finished or paused — record it so nothing gets lost: run "
+              f"`t done {tid}` if it is complete, otherwise `t next {tid} \"<one-line next step>\"`.")
+    name = f"{tid}-" + re.sub(r"[^a-z0-9]+", "-", t.text.lower())[:30].strip("-")
+    argv, new_sid = build_argv(via, prompt, name, resume)
+    if new_sid: t.f["sid"] = new_sid
+    t.f["via"] = via
+    t.notes.append(f"{'resumed' if resume else 'started'} {now:%Y-%m-%d %H:%M} via {via}")
+    save(head, tasks)
+    launch(folder, via, argv)
+
+
+def build_argv(via, prompt, name, resume=None):
+    """Command line for an assistant. Returns (argv, claude session id or None)."""
+    if via == "claude" or via.startswith("kit:"):
+        base = ["claude"] if via == "claude" else [KIT, via[4:]]
+        if resume: return base + ["--resume", resume], resume
+        sid = str(uuid.uuid4())
+        return base + ["--session-id", sid, "-n", name] + ([prompt] if prompt else []), sid
+    if via == "codex": return ["codex"] + ([prompt] if prompt else []), None
+    if via == "gemini": return ["gemini"] + (["-i", prompt] if prompt else []), None
+    if prompt:
+        subprocess.run(["pbcopy"], input=prompt, text=True)
+        print(dim("prompt copied to clipboard — paste it in"))
+    return [via], None
+
+
+def launch(folder, via, argv):
+    if not sys.stdout.isatty():  # called from an agent or a script: exec here would run the session headless
+        cmd = f"cd {shlex.quote(str(folder))} && {shlex.join(argv)}"
+        esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(["osascript", "-e", f'tell application "iTerm2"\n  activate\n'
+                        f'  tell (create window with default profile) to tell current session to write text "{esc}"\nend tell'],
+                       capture_output=True, text=True)
+        return print(f"→ opened in a new iTerm window: {short(folder)} · {via}")
+    os.chdir(folder)
+    print(dim(f"→ {short(folder)} · {via}"), flush=True)
+    os.execvp(argv[0], argv)
+
+
+# ── choosing how to start ─────────────────────────────────────────────────────
+def key(prompt):
+    import termios
+    import tty as tty_mod
+    print(prompt, end="", flush=True)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty_mod.setcbreak(fd)
+        ch = sys.stdin.read(1)
+    except KeyboardInterrupt: ch = "q"
+    finally: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print()
+    return ch
+
+
+def kit_for(text, timeout=4):
+    """kogitsune's kit selector (learned router is instant; cold path asks haiku)."""
+    try:
+        r = subprocess.run([KIT, "for", text], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired): return None
+    m = re.search(r"for: (\S+)", r.stderr)
+    return m[1] if m else None
+
+
+def history():
+    """Recent Claude conversations, newest first: {sid, ts, cwd, last}."""
+    rows = {}
+    try: lines = HIST.read_text(errors="ignore").splitlines()[-6000:]
+    except OSError: return []
+    for line in lines:
+        try: h = json.loads(line)
+        except ValueError: continue
+        sid, cwd = h.get("sessionId"), h.get("project", "")
+        if not sid or "/private/tmp" in cwd or "/.claude-mem/" in cwd: continue
+        r = rows.setdefault(sid, dict(sid=sid, cwd=cwd, last=""))
+        r["ts"] = h.get("timestamp", 0) / 1000
+        txt = " ".join(h.get("display", "").split())
+        if txt and not txt.startswith("/"): r["last"] = txt
+    return sorted(rows.values(), key=lambda r: -r["ts"])
+
+
+def last_session(folder):
+    for h in history():
+        if h["cwd"] == str(folder) and session_exists(h["sid"]): return h
+
+
+def choose(folder, text, preferred=None, task=None):
+    """Ask how to start in `folder`. Returns (via, resume_sid) or (None, None) on cancel."""
+    last = last_session(folder)
+    kit = kit_for(text) if task else None
+    opts = {"c": ("claude", None, "claude new"), "x": ("codex", None, "codex")}
+    if kit: opts["k"] = (f"kit:{kit}", None, f"kit {kit}")
+    if last: opts["r"] = ("claude", last["sid"], f"resume “{last['last'][:40]}” {ago(dt.datetime.now().timestamp() - last['ts'])} ago")
+    if preferred and preferred not in ("claude", "codex") and not preferred.startswith("kit:"):
+        opts["o"] = (preferred, None, preferred)
+    default = ("k" if kit else "c") if task else ("r" if last and dt.datetime.now().timestamp() - last["ts"] < 86400 else "c")
+    if preferred:
+        default = next((k for k, v in opts.items() if v[0] == preferred and v[1] is None), default)
+    print(bold(f"start in {short(folder)}") + (dim(f"  · kogitsune suggests kit {kit}") if kit else ""))
+    print("  " + " · ".join(f"{bold(k)} {v[2]}" for k, v in opts.items()) + f" · {bold('q')} cancel")
+    if not sys.stdin.isatty(): ch = ""
+    else: ch = key(f"  ⏎ = {opts[default][2]} › ").strip().lower()
+    if ch == "q": return None, None
+    if ch == "k" and "k" not in opts:
+        print(dim("asking kogitsune…")); kit = kit_for(text or folder.name, timeout=30)
+        return (f"kit:{kit}", None) if kit else ("claude", None)
+    v = opts.get(ch or default, opts[default])
+    return v[0], v[1]
+
+
+# ── handoffs ──────────────────────────────────────────────────────────────────
+SKIP_DIRS = {"node_modules", ".git", "_archive", "archive", ".worktrees", ".venv", "venv", "dist", "build",
+             "graphify-out", "__pycache__", ".next", "_backups"}
+SUBDIRS = {"docs", "internal", "plans", "notes", ".superpowers", "sdd", "data"}
+
+
+def handoff_files(root, max_age_days=None):
+    cutoff = dt.datetime.now().timestamp() - max_age_days * 86400 if max_age_days else 0
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.endswith(".worktrees")]
+        for f in files:
+            if f.startswith("HANDOFF") and f.endswith(".md"):
+                p = Path(dirpath) / f
+                m = p.stat().st_mtime
+                if m >= cutoff: yield p, m
+
+
+def project_of(p):
+    d = p.parent
+    while d.name in SUBDIRS and d != ROOT: d = d.parent
+    return d
+
+
+def latest_handoff(folder):
+    best = max(((m, p) for p, m in handoff_files(folder) if len(p.relative_to(folder).parts) <= 3), default=None)
+    return best[1] if best else None
+
+
+def handoff_summary(p):
+    """(title, first next step) from a handoff file."""
+    title, step, in_next = "", "", False
+    for line in p.read_text(errors="ignore").splitlines():
+        if not title and line.startswith("# "): title = line[2:].strip()
+        if line.startswith("#"):
+            in_next = bool(re.search(r"next|nächst|offen|open|pending", line, re.I))
+            continue
+        if in_next and not step and line.strip():
+            step = re.sub(r"^\s*(\d+\.|[-*])\s*", "", line).replace("**", "").strip()
+    return title, step
+
+
+def handoff_map(days=21):
+    """{project dir: (mtime, newest handoff)} across ROOT."""
+    latest = {}
+    for p, m in handoff_files(ROOT, days):
+        k = project_of(p)
+        if m > latest.get(k, (0, None))[0]: latest[k] = (m, p)
+    return latest
+
+
+def task_handoff(t, latest):
+    d = resolve_dir(t.f.get("at"))
+    return max((v for k, v in latest.items() if k == d or d in k.parents), default=None) if d else None
+
+
+def handoffs_cmd(args):
+    days = int(args[0]) if args and args[0].isdigit() else 21
+    latest = handoff_map(days)
+    _, tasks = load()
+    open_at = {}
+    for t in tasks:
+        if not t.done and "at" in t.f: open_at.setdefault(str(resolve_dir(t.f["at"])), []).append(t.id)
+    nowts = dt.datetime.now().timestamp()
+    print(bold("📄 HANDOFFS") + dim(f"  (newest per project, last {days} days)"))
+    for k, (m, p) in sorted(latest.items(), key=lambda kv: -kv[1][0]):
+        _, step = handoff_summary(p)
+        age = ago(nowts - m)
+        age = (grn if nowts - m < 3 * 86400 else yel if nowts - m < 10 * 86400 else red)(pad(age, 5))
+        ids = open_at.get(str(k))
+        tag = cyan(f" [{','.join(ids)}]") if ids else dim(" (no task)")
+        name = short(k)
+        name = name if len(name) <= 52 else "…" + name[-51:]
+        print(f"  {age} {bold(name)}{tag}")
+        if step: print(f"        {dim('→ ' + step[:110])}")
+
+
+# ── html page: value ÷ effort ─────────────────────────────────────────────────
+PUB = Path(os.environ.get("TYAT_PUBLISHER", ROOT / "article_publisher")).expanduser()
+PAGE = Path(os.environ.get("TYAT_PAGE", APP / "next.html")).expanduser()
+CAL_DONE = {"posted", "skipped", "scheduled", "done"}
+POST_EST = {"ready": 15, "review": 30, "blocked": 45}  # minutes left on a calendar row by status
+
+
+def est_min(s):
+    m = re.fullmatch(r"(\d+)(m|h)", s or "")
+    return int(m[1]) * (60 if m[2] == "h" else 1) if m else None
+
+
+def urgency(due):
+    if due is None: return 0
+    h = (due - now).total_seconds() / 3600
+    return 4 if h <= 0 else 3 if h <= 24 else 2 if h <= 72 else 1 if h <= 168 else 0
+
+
+def leverage(value, mins):
+    """value per unit of effort; effort grows slowly so big wins still beat busywork."""
+    return value / math.log2(2 + mins / 15)
+
+
+def activity_windows(days=21):
+    """(prep, exec) start hours learned from your own prompt history (~/.claude/history.jsonl).
+    exec = busiest 2h inside business hours (the people you send to are awake),
+    prep = busiest 3h stretch outside it (deep work, when you are actually at the keyboard)."""
+    counts, cutoff = [0] * 24, (now - dt.timedelta(days)).timestamp() * 1000
+    try:
+        with HIST.open(errors="ignore") as f:
+            for line in f:
+                m = re.search(r'"timestamp":\s*(\d+)', line)
+                if m and int(m[1]) >= cutoff: counts[dt.datetime.fromtimestamp(int(m[1]) / 1000).hour] += 1
+    except OSError: pass
+    if sum(counts) < 50: return 22, 12, counts
+    ex = max(range(9, 17), key=lambda h: counts[h] + counts[h + 1])
+    prep = max((h for h in range(24) if all((h + i) % 24 not in (ex, ex + 1) for i in range(3))),
+               key=lambda h: sum(counts[(h + i) % 24] for i in range(3)))
+    return prep, ex, counts
+
+
+def rhythm():
+    """The day you are aiming for (not the one the history shows). Override with
+    TYAT_RHYTHM="do=12,2 prep=22,3.5 sport=16,1.5 stop=01:30" (start hour, length in hours).
+    Default: the night is the productive block; fewer hours come from dropping the scattered daytime work."""
+    g = {"do": (12, 2), "prep": (22, 3.5), "sport": (16, 1.5), "stop": (1, 30), "deep": ((14, 2),)}
+    for part in os.environ.get("TYAT_RHYTHM", "").split():
+        k, _, v = part.partition("=")
+        if k == "stop" and re.fullmatch(r"\d{1,2}:\d{2}", v): g[k] = tuple(map(int, v.split(":")))
+        elif k in g and re.fullmatch(r"\d{1,2},\d+(\.\d+)?", v): g[k] = (int(v.split(",")[0]), float(v.split(",")[1]))
+    return g
+
+
+def after_stop(h, stop):
+    """Is hour h between the shutdown time and 05:00?"""
+    first = stop[0] + (stop[1] > 0)  # first full hour after the stop
+    return first <= h < 5 if first < 5 else h >= first or h < 5
+
+
+def night_share(counts_by_day, stop):
+    """% of prompts after the shutdown time — the number to push down."""
+    total = sum(counts_by_day) or 1
+    late = sum(c for h, c in enumerate(counts_by_day) if after_stop(h, stop))
+    return round(100 * late / total)
+
+
+def schedule(items, g, horizon=30):
+    """Lay items into the blocks of the next `horizon` hours. Prep work fits prep and deep blocks, do work
+    only do blocks (or the prep block before, to queue it, when no do block comes in time).
+    Deadlines still ahead go first (earliest first), then late items, then the rest by value ÷ effort;
+    nothing goes into a block that starts after its deadline. A deadline no block can hold is worked
+    right now, outside the rhythm (a "now" block); only what can't be done by its deadline even then overflows.
+    Returns ([(start, kind, [items])], overflow)."""
+    blocks = []
+    for kind, wins in (("prep", [g["prep"]]), ("deep", g["deep"]), ("do", [g["do"]])):
+        for h, n in wins:
+            for day in range(-1, 3):  # -1: the night block that began yesterday may still be running
+                start = (now + dt.timedelta(days=day)).replace(hour=h, minute=0)
+                end = start + dt.timedelta(hours=n)
+                if end > now and start < now + dt.timedelta(hours=horizon):
+                    mins = (end - max(start, now)).total_seconds() / 60
+                    blocks.append([max(start, now), mins, kind, [], mins])  # start, minutes left, kind, items, minutes total
+    blocks.sort(key=lambda b: b[0])
+    fits = {"prep": ("prep", "deep"), "exec": ("do",)}
+    soon = now + dt.timedelta(hours=horizon)
+    overflow, rush = [], [now, 0, "now", []]  # rush counts minutes already promised, not minutes left
+    running = [b for b in blocks if b[0] == now]
+    def order(i):
+        if i["due"] and now < i["due"] <= soon: return (0, i["due"].timestamp())  # still savable: earliest deadline first
+        if i["due"] and i["due"] <= now: return (1, -i["lev"])                    # already late
+        return (2, -i["lev"])
+    def in_time(b, i):  # done before the deadline, counting the work already in the block
+        return b[0] + dt.timedelta(minutes=b[4] - b[1] + i["mins"]) <= i["due"]
+    for i in sorted(items, key=order):
+        free = [b for b in blocks if b[2] in fits[i["mode"]] and b[1] >= i["mins"]]
+        if i["due"] and i["due"] > now:
+            free = [b for b in free if in_time(b, i)]
+            if not free and i["mode"] == "exec" and not i.get("day"):  # do block too late: queue it during prep
+                free = [b for b in blocks if b[2] == "prep" and b[1] >= i["mins"] and in_time(b, i)]
+        if free: free[0][1] -= i["mins"]; free[0][3].append(i)
+        elif i["due"] and now < i["due"] and not (i.get("day") and not 9 <= now.hour < 20) and rush[1] + i["mins"] + sum(
+                x["mins"] for b in running for x in b[3]) <= (i["due"] - now).total_seconds() / 60:
+            rush[1] += i["mins"]; rush[3].append(i)
+            for b in running: b[1] -= i["mins"]  # rush work eats the block we are in
+        elif i["due"] and i["due"] <= soon: overflow.append(i)
+    return [(b[0], b[2], b[3]) for b in ([rush] if rush[3] else []) + blocks], overflow
+
+
+def next_slot(hour, length, not_before=None):
+    """Start of the next window [hour, hour+length) — now, if we are inside it."""
+    t = not_before or now
+    start = t.replace(hour=hour, minute=0)
+    if start > t: start -= dt.timedelta(days=1)
+    return t if start <= t < start + dt.timedelta(hours=length) else start + dt.timedelta(days=1)
+
+
+def calendar_rows(days=10):
+    """Open rows of article_publisher's editorial calendar that are late or due within `days`."""
+    cal = PUB / "docs/editorial-calendar.md"
+    if not cal.exists(): return []
+    try: weight = json.loads((PUB / "docs/priority.json").read_text())
+    except (OSError, ValueError): weight = {}
+    def clean(s): return re.sub(r"\*\*|`|~~|\*", "", s).strip(" —-")
+    out, cols = [], None
+    for line in cal.read_text(errors="ignore").splitlines():
+        if not line.startswith("|"): cols = None; continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if "story" in cells and "target_datetime" in cells: cols = {c: i for i, c in enumerate(cells)}; continue
+        if not cols or len(cells) < len(cols) or set(cells[0]) <= set("-: "): continue
+        row = {c: cells[i] for c, i in cols.items()}
+        status = (re.findall(r"[a-z]+", row.get("status", "").lower()) or [""])[0]
+        if status in CAL_DONE: continue
+        when = re.sub(r"~~.*?~~", "", row["target_datetime"])
+        d = re.search(r"\d{4}-\d{2}-\d{2}", when)
+        if not d: continue
+        tm = re.search(r"\b(\d{1,2}):(\d{2})\b", when)
+        due = dt.datetime.fromisoformat(d[0]).replace(hour=int(tm[1]) if tm else 9, minute=int(tm[2]) if tm else 0)
+        if due.date() > now.date() + dt.timedelta(days): continue
+        group = clean(row.get("group", ""))
+        w = weight.get(group, {})
+        out.append({"due": due, "title": clean(row["story"]), "channel": clean(row.get("channel", "")), "status": status,
+                    "blocker": clean(row.get("blocker", "")), "group": group,
+                    "reach": int(w.get("wichtigkeit", 3)) if isinstance(w, dict) else 3})
+    return sorted(out, key=lambda r: r["due"])
+
+
+# "Needs you": steps only Marty can do (send, post, call, approve, pay, pick up …). An agent can prepare them,
+# never finish them. `me:1` / `me:0` on the task overrides the guess.
+ME_WORDS = re.compile(r"\b(send\w*|sende\w*|schick\w*|verschick\w*|verteil\w*|posts?|posten|queue|call|anruf\w*|"
+                      r"whatsapp|reply|antwort\w*|approve\w*|freigabe|pay|bezahl\w*|order|bestell\w*|pick up|abhol\w*|"
+                      r"ask|frag\w*|talk|submit|einreich\w*|upload\w*|anmeld\w*|beantrag\w*|meeting|termin)\b", re.I)
+
+
+# Of those, the ones that reach other people (send, call, talk …) happen while people are awake: do block only,
+# never the night block, never queued at night. Fixed appointments (fix:1 or the words below) are never moved.
+DAY_WORDS = re.compile(r"\b(send\w*|sende\w*|schick\w*|verschick\w*|verteil\w*|call|anruf\w*|whatsapp|reply|"
+                       r"antwort\w*|ask|frag\w*|talk|order|bestell\w*|pick up|abhol\w*|meeting|termin)\b", re.I)
+FIX_WORDS = re.compile(r"\b(meeting|termin|appointment|sprechstunde|begutachtung)\b", re.I)
+
+
+def daytime(t): return needs_me(t) and bool(DAY_WORDS.search(t.text)) and t.f.get("me") != "0"
+def fixed(t): return t.f.get("fix") == "1" or (t.f.get("fix") != "0" and bool(FIX_WORDS.search(t.text)))
+
+
+def deadline(t):
+    try: return dt.datetime.fromisoformat(t.f["dl"])
+    except (KeyError, ValueError): return None
+
+
+def needs_me(t):
+    if t.f.get("me") in ("0", "1"): return t.f["me"] == "1"
+    return bool(ME_WORDS.search(t.text))
+
+
+def page_items(tasks, latest):
+    items = []
+    for t in tasks:
+        if t.done: continue
+        reach = int(t.f["reach"]) if t.f.get("reach", "").isdigit() else 2
+        mins = est_min(t.f.get("est")) or 60
+        value = 2 * reach + t.pri + 1.5 * urgency(t.due)
+        hp = task_handoff(t, latest)
+        items.append({"kind": "task", "mode": "exec" if mins <= 15 or daytime(t) else "prep", "day": daytime(t), "id": t.id, "title": t.text, "where": t.f.get("at", ""), "due": t.due,
+                      "reach": reach, "pri": t.pri, "mins": mins, "est": "est" in t.f, "value": value,
+                      "lev": leverage(value, mins), "next": t.next, "hand": hp and (hp[0], handoff_summary(hp[1])[1]),
+                      "cmd": f"t go {t.id}", "me": needs_me(t)})
+    for r in calendar_rows():
+        if r["due"] < now - dt.timedelta(days=3): r["stale"] = True
+        mins = POST_EST.get(r["status"], 60)
+        value = 2 * r["reach"] + 1.5 * urgency(r["due"]) + (1 if r["status"] == "ready" else 0)
+        items.append({**r, "kind": "post", "mode": "exec" if r["status"] == "ready" else "prep", "id": "📰", "where": r["channel"], "pri": 0, "mins": mins, "est": True,
+                      "value": value, "lev": leverage(value, mins), "next": r["blocker"], "hand": None,
+                      "cmd": f"cd {PUB} && npm run -s plan", "me": r["status"] == "ready"})
+    return sorted(items, key=lambda i: -i["lev"])
+
+
+ICON = {"prep": "🌙", "deep": "🧠", "do": "☀️", "now": "🔥"}  # "prep" is the night block
+
+# Who a task is for, first match wins: (label, folder prefixes, title words, channel words). Order = order on the page.
+# Posts carry their channel in "where", so channel words sort calendar rows; tasks match on folder and title.
+CATEGORIES = [
+    ("🎤 Club · Berliner Rhetorikmeister", ("community/toastmasters/brm",), ("brm", "rhetorikmeister", "clubabend"),
+     ("brm", "whatsapp", "meetup", "clubabend")),
+    ("🤝 AI Builders", ("aibuilders",), ("hack day", "hackday"), ()),
+    ("🏛 Toastmasters · District 95", ("community/toastmasters",), ("toastmasters", "tm-tag", "d95"), ()),
+    ("📣 Visibility · own posts", ("article_publisher",), (), ("linkedin", "medium")),
+    ("🚀 Products & launches", ("kitsunemcp", "products/", "hackathons/"), (), ()),
+    ("🔬 Research & funding", ("kaiser-data/", "research/"), ("apart", "funding"), ()),
+    ("💼 Work", ("work/",), (), ()),
+    ("🏠 Personal & family", ("_personal", "_inbox"), ("family",), ()),
+    ("📚 Learning", (), ("nebius", "exam"), ()),
+    ("🛠 System & admin", ("_reorg", "tend-your-agent-task"), (), ()),
+]
+
+
+def category(title, where):
+    t, w = title.lower(), where.lower().strip("/")
+    for label, _, words, chans in CATEGORIES:  # title first: a BRM post in article_publisher is club work
+        if any(x in t for x in words) or any(x in w for x in chans): return label
+    for label, folders, _, _ in CATEGORIES:
+        if any(w.startswith(f) or f"/{f}" in f"/{w}" for f in folders): return label
+    return "📦 Other"
+
+
+def page_html(items, ss, loose, windows):
+    E = html.escape
+    learned_prep, learned_exec, counts = windows
+    g = rhythm()
+    (prep_h, prep_n), (exec_h, exec_n), (sport_h, sport_n), stop = g["prep"], g["do"], g["sport"], g["stop"]
+    night = night_share(counts, stop)
+    live = [i for i in items if not i.get("stale")]
+    peak = max(counts) or 1
+    for i in live:
+        h, n = (prep_h, prep_n) if i["mode"] == "prep" else (exec_h, exec_n)
+        i["slot"] = next_slot(h, n)
+        if i["due"] and i["due"] < i["slot"]: i["slot"] = now  # the window comes too late: do it now
+        i["offhours"] = i["kind"] == "post" and i["due"] and not (exec_h <= i["due"].hour < exec_h + exec_n)
+
+    timeline, overflow = schedule(live, g)
+    for start, _, rows in timeline:
+        for i in rows: i["slot"] = start
+    used = sum(i["mins"] for _, _, rows in timeline for i in rows)
+    quick = [i for i in live if i["est"] and i["mins"] <= 15]
+    stale = [i for i in items if i.get("stale")]
+    late = sum(1 for i in live if i["due"] and i["due"] <= now)
+
+    def due(i):
+        if not i["due"]: return '<span class="due">no date</span>'
+        u = urgency(i["due"])
+        return f'<span class="due u{u}">{E(ANSI.sub("", fmt_due(i["due"])))}</span>'
+
+    def card(i, n=None):
+        hand = ""
+        if i["hand"] and i["hand"][1]:
+            hand = f'<p class="hand">📄 {ago(now.timestamp() - i["hand"][0])} ago · {E(i["hand"][1][:180])}</p>'
+        nxt = f'<p class="next">→ {E(i["next"][:200])}</p>' if i["next"] else ""
+        badge = f'<span class="st {E(i["status"])}">{E(i["status"])}</span>' if i["kind"] == "post" else ""
+        when = "now" if i["slot"] == now else ANSI.sub("", fmt_due(i["slot"]))
+        slot = f'<p class="slot {i["mode"]}">{"🌙 prep" if i["mode"] == "prep" else "☀️ do"} · {E(when)}</p>'
+        if i["offhours"]:
+            slot += (f'<p class="warn">⚠ {i["due"]:%H:%M} is outside your do block: queue it in the scheduler '
+                     f'during the prep block the night before, or move the slot to {exec_h}:30</p>')
+        rank = f'<span class="rank">{n}</span>' if n else ""
+        return (f'<li class="card {i["kind"]}">{rank}<div class="meta"><b class="id">{E(i["id"])}</b>{due(i)}{badge}'
+                f'<span class="reach" title="reach">{"●" * i["reach"]}{"○" * (5 - i["reach"])}</span>'
+                f'<span class="mins">{i["mins"]}m</span><span class="lev" title="value ÷ effort">⚡{i["lev"]:.1f}</span></div>'
+                f'<h3>{"!" * i["pri"]}{E(i["title"])}</h3><p class="where">{E(i["where"])}</p>{slot}{nxt}{hand}'
+                f'<button data-cmd="{E(i["cmd"])}">{E(i["cmd"][:40])}</button></li>')
+
+    def section(title, sub, rows, cls="grid", numbered=False):
+        if not rows: return ""
+        body = "".join(card(r, n if numbered else None) for n, r in enumerate(rows, 1))
+        return f'<section><h2>{title} <small>{sub}</small></h2><ul class="{cls}">{body}</ul></section>'
+
+    def by_category(rows):
+        groups = {}
+        for i in rows: groups.setdefault(category(i["title"], i["where"]), []).append(i)
+        order = [c[0] for c in CATEGORIES] + ["📦 Other"]
+        far = dt.datetime.max
+        chips = "".join(f'<a href="#c{n}">{E(c)} <b>{len(groups[c])}</b></a>' for n, c in enumerate(order) if c in groups)
+        body = "".join(
+            f'<section id="c{n}"><h2>{E(c)} <small>{sum(1 for i in groups[c] if i["kind"] == "task")} tasks · '
+            f'{sum(1 for i in groups[c] if i["kind"] == "post")} posts · {sum(i["mins"] for i in groups[c]) / 60:.1f}h · by due date</small></h2>'
+            f'<ul class="grid">{"".join(card(i) for i in sorted(groups[c], key=lambda i: i["due"] or far))}</ul></section>'
+            for n, c in enumerate(order) if c in groups)
+        return f'<section><h2>🗂 By category <small>who it is for</small></h2><nav class="chips">{chips}</nav></section>{body}'
+
+    def plan_list(title, rows):
+        lis = "".join(f'<li data-k="{E(i["id"] + i["title"][:30])}"><input type="checkbox"><span class="t">{i["mins"]}m</span>'
+                      f'<span class="x">{"📰 " if i["kind"] == "post" else ""}<b>{E(i["id"]) if i["kind"] == "task" else ""}</b> {E(i["title"])}</span></li>' for i in rows)
+        return f'<section><h2>{title}</h2><ul class="plan">{lis or "<li>nothing queued</li>"}</ul></section>'
+
+    on_you = "".join(f'<button data-cmd="t {n}">{E(ON_YOU[s["status"]])} · {E(s["who"])} · {E(short(s["cwd"]))} · {ago(s["since"])}</button>'
+                     for n, s in enumerate(ss, 1) if s["status"] in ON_YOU)
+    loose_html = "".join(f'<li><b>{E(short(k))}</b> <span class="due">{ago(now.timestamp() - m)} ago</span><br>{E(step[:180])}'
+                         f'<button data-cmd="t add {E(step[:60])} @{E(short(k))}">t add …</button></li>' for k, m, step in loose)
+    stale_html = "".join(f'<li>{E(i["due"].strftime("%d.%m."))} · {E(i["title"])} <span class="due">{E(i["where"])}</span></li>' for i in stale)
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tyat · next</title><style>
+:root{{--bg:#f6f5f1;--card:#fff;--ink:#1d1d1b;--mute:#6b6a65;--line:#e3e1da;--acc:#2f6f4f;--hot:#c2410c;--warm:#b7791f;--post:#3b5bdb}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{--bg:#151614;--card:#1f201d;--ink:#ecebe6;--mute:#9a998f;--line:#33342f;--acc:#7cc59b;--hot:#fb923c;--warm:#facc15;--post:#91a7ff}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 -apple-system,system-ui,sans-serif}}
+main{{max-width:1180px;margin:auto;padding:24px 16px 64px}}header{{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:baseline}}
+h1{{margin:0;font-size:26px}}.kpi b{{font-size:22px;display:block}}.kpi{{color:var(--mute);font-size:13px}}.kpi.hot b{{color:var(--hot)}}
+h2{{font-size:17px;margin:34px 0 10px}}h2 small{{color:var(--mute);font-weight:400;font-size:13px}}
+ul{{list-style:none;margin:0;padding:0}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}}
+.hero{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}}.hero .card{{border:2px solid var(--acc)}}.hero h3{{font-size:18px}}
+.card{{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px 14px}}
+.card.post{{border-left:4px solid var(--post)}}.card h3{{margin:6px 0 2px;font-size:15px}}
+.rank{{position:absolute;top:-10px;left:-8px;background:var(--acc);color:var(--bg);border-radius:50%;width:24px;height:24px;display:grid;place-items:center;font-size:13px;font-weight:700}}
+.meta{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;color:var(--mute)}}.id{{color:var(--ink)}}
+.u4{{color:var(--hot);font-weight:600}}.u3{{color:var(--warm);font-weight:600}}.reach{{letter-spacing:-1px;color:var(--acc)}}.lev{{margin-left:auto;font-weight:600;color:var(--ink)}}
+.st{{border:1px solid currentColor;border-radius:99px;padding:0 6px}}.st.blocked{{color:var(--hot)}}.st.ready{{color:var(--acc)}}
+.where,.hand,.next{{margin:4px 0 0;font-size:13px;color:var(--mute);overflow-wrap:anywhere}}.next{{color:var(--ink)}}
+button{{margin-top:8px;font:12px ui-monospace,monospace;background:transparent;color:var(--mute);border:1px dashed var(--line);border-radius:6px;padding:3px 8px;cursor:pointer}}
+button:hover{{color:var(--ink);border-color:var(--mute)}}button.ok{{color:var(--acc);border-color:var(--acc)}}
+.plan li{{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line)}}.plan input{{transform:scale(1.2)}}
+.plan .t{{color:var(--mute);font:12px ui-monospace,monospace;min-width:48px}}.plan li.done span.x{{text-decoration:line-through;color:var(--mute)}}
+.loose li,.stale li{{padding:8px 0;border-bottom:1px solid var(--line)}}details summary{{cursor:pointer;color:var(--mute)}}
+.rhythm{{display:flex;align-items:flex-end;gap:3px;height:64px}}.rhythm i{{flex:1;background:var(--line);border-radius:3px 3px 0 0}}.rhythm i.p,.lp{{background:none;color:var(--post)}}.rhythm i.p{{background:var(--post)}}.rhythm i.e{{background:var(--warm)}}.le{{color:var(--warm)}}.rhythm i.s,.ls{{color:var(--acc)}}.rhythm i.s{{background:var(--acc)}}.rhythm i.n{{background:var(--hot);opacity:.55}}.ln{{color:var(--hot)}}
+.legend{{font-size:13px;color:var(--mute)}}.blocks{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:0 24px}}
+.slot{{margin:6px 0 0;font-size:12px;font-weight:600}}.slot.prep{{color:var(--post)}}.slot.exec{{color:var(--warm)}}.warn{{margin:4px 0 0;font-size:12px;color:var(--hot)}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px}}.chips a{{color:var(--ink);text-decoration:none;border:1px solid var(--line);background:var(--card);border-radius:99px;padding:4px 10px;font-size:13px}}.chips a b{{color:var(--acc)}}
+.onyou{{display:flex;flex-wrap:wrap;gap:6px}}.onyou button{{color:var(--hot);border-color:var(--hot)}}footer{{margin-top:40px;color:var(--mute);font-size:12px}}
+</style></head><body><main>
+<header><h1>🌱 What next</h1><span class="kpi">{now:%a %d %b, %H:%M}</span>
+<span class="kpi hot"><b>{late}</b>late</span><span class="kpi"><b>{sum(1 for i in live if i["kind"] == "task")}</b>tasks</span>
+<span class="kpi"><b>{sum(1 for i in live if i["kind"] == "post")}</b>posts ≤10d</span><span class="kpi"><b>{used / 60:.1f}h</b>planned</span><span class="kpi hot"><b>{night}%</b>after {stop[0]:02d}:{stop[1]:02d}</span></header>
+{f'<section><h2>⏳ Sessions waiting on you</h2><div class="onyou">{on_you}</div></section>' if on_you else ''}
+<section><h2>▶ Do these three <small>highest value ÷ effort · value = 2×reach + priority + urgency</small></h2><ul class="hero">{"".join(card(i, n) for n, i in enumerate(live[:3], 1))}</ul></section>
+<section><h2>⏱ Your day <small>bars = your prompts per hour, last 21 days · colours = the day you are aiming for</small></h2><div class="rhythm">{"".join(
+    f'<i class="{"p" if (h - prep_h) % 24 < prep_n else "e" if 0 <= h - exec_h < exec_n else "s" if 0 <= h - sport_h < sport_n else "n" if after_stop(h, stop) else ""}" style="height:{4 + 56 * c / peak:.0f}px" title="{h}:00 · {c}"></i>' for h, c in enumerate(counts))}</div>
+<p class="legend"><span class="le">■</span> do {exec_h:02d}:00 +{exec_n:g}h: sends, posts, replies, from the phone · <span class="lp">■</span> night {prep_h:02d}:00 +{prep_n:g}h: your productive block — deep work, drafts, queue tomorrow · <span class="ls">■</span> sport {sport_h:02d}:00 +{sport_n:g}h: blocked, no tasks · <span class="ln">■</span> after {stop[0]:02d}:{stop[1]:02d}: shut down — <b>{night}%</b> of your prompts still land here (learned peaks today: {learned_exec}:00 and {learned_prep}:00)</p></section>
+<div class="blocks">{"".join(plan_list(f"{ICON[kind]} {kind.title()} · {ANSI.sub('', fmt_due(start)) if start > now else 'now'} · {sum(i['mins'] for i in rows)}m", rows) for start, kind, rows in timeline if rows)}</div>
+{plan_list(f"🚫 Doesn't fit before it's due · {sum(i['mins'] for i in overflow)}m — snooze, delegate or drop", overflow) if overflow else ""}
+{section("⚡ Quick wins", "≤15 min, clear these between deep blocks", quick)}
+{section("📰 Publishing pipeline", "editorial calendar, next 10 days — reach is the visible half of the work", [i for i in live if i["kind"] == "post"])}
+{by_category(live)}
+{f'<section><h2>🧵 Loose ends <small>fresh handoffs with no task yet</small></h2><ul class="loose">{loose_html}</ul></section>' if loose else ''}
+{f'<section><details><summary>🧊 {len(stale)} calendar rows more than 3 days late: post or mark skipped</summary><ul class="stale">{stale_html}</ul></details></section>' if stale else ''}
+<footer>tyat {__version__} · regenerate with <code>t page</code> · tasks without est: count as 60m, without reach: as 2 · reach of posts from article_publisher/docs/priority.json</footer>
+</main><script>
+document.addEventListener('click',e=>{{const b=e.target.closest('[data-cmd]');if(!b)return;
+  (navigator.clipboard?navigator.clipboard.writeText(b.dataset.cmd):Promise.reject()).then(()=>{{b.classList.add('ok');setTimeout(()=>b.classList.remove('ok'),900)}}).catch(()=>prompt('copy',b.dataset.cmd))}});
+const K='tyat-plan-{now:%Y-%m-%d}';let s={{}};try{{s=JSON.parse(localStorage.getItem(K)||'{{}}')}}catch(e){{}}
+document.querySelectorAll('.plan li').forEach(li=>{{const c=li.querySelector('input');c.checked=!!s[li.dataset.k];li.classList.toggle('done',c.checked);
+  c.onchange=()=>{{s[li.dataset.k]=c.checked;li.classList.toggle('done',c.checked);try{{localStorage.setItem(K,JSON.stringify(s))}}catch(e){{}}}}}});
+</script></body></html>"""
+
+
+def page_cmd(args):
+    _, tasks = load()
+    latest = handoff_map()
+    covered = {resolve_dir(t.f["at"]) for t in tasks if not t.done and "at" in t.f}
+    fresh = now.timestamp() - 3 * 86400
+    loose = [(k, m, handoff_summary(p)[1]) for k, (m, p) in sorted(latest.items(), key=lambda kv: -kv[1][0])
+             if m >= fresh and k not in covered and not any(c and c in k.parents for c in covered)]
+    items = page_items(tasks, latest)
+    PAGE.write_text(page_html(items, ordered_sessions(), loose, activity_windows()))
+    print(f"wrote {PAGE}")
+    if "--publish" in args: return publish(items, args)
+    if "--no-open" not in args and sys.platform == "darwin": subprocess.run(["open", str(PAGE)])
+
+
+# ── phone plan: t page --publish ──────────────────────────────────────────────
+# A private PWA behind a key-guarded Cloudflare Worker (worker.js + wrangler.jsonc with run_worker_first live in
+# PLAN/, gitignored). tyat only writes PLAN/public/index.html and the voice clips, then runs `wrangler deploy`.
+PLAN = Path(os.environ.get("TYAT_PLAN", APP / "pub-plan")).expanduser()
+WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+NTH = ["Erstens", "Zweitens", "Drittens", "Viertens", "Fünftens"]
+BLOCK_DE = {"now": ("🔥", "Jetzt, außer der Reihe"), "prep": ("🌙", "Nacht-Block"), "deep": ("🧠", "Deep-Block"),
+            "do": ("☀️", "Do-Block"), "sport": ("🏃", "Sport"), "stop": ("😴", "Schluss")}
+
+
+def de_when(d):
+    if d.date() == now.date(): return d.strftime("%H:%M")
+    if d.date() == now.date() + dt.timedelta(1): return d.strftime("morgen %H:%M")
+    return f"{WD[d.weekday()]} {d:%H:%M}"
+
+
+def speakable(s):
+    """Text an ElevenLabs voice reads well: no emoji, ids, paths or markup."""
+    s = re.sub(r"<[^>]*>", "", s)
+    s = re.sub("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", s)
+    s = re.sub(r"[`*_#>|\[\]{}]|\S+/\S+", " ", s)
+    return re.sub(r"\s+", " ", s).strip(" .:-")
+
+
+def voice_text(kind, rows, stop):
+    if kind == "sport": return "Sportzeit. Laptop zu, die Aufgaben warten."
+    if kind == "stop": return f"Es ist {stop[0]} Uhr{f' {stop[1]}' if stop[1] else ''}. Handoff schreiben, t next eintragen, Laptop zu. Gute Nacht."
+    head = {"now": "Jetzt zuerst das mit Deadline.", "prep": "Nacht-Block.", "deep": "Deep-Block.",
+            "do": "Do-Block, alles vom Handy."}[kind]
+    parts = [f"{NTH[n]}: {speakable(i['title'])}" + (" — mit Deadline" if i["due"] else "") for n, i in enumerate(rows[:4])]
+    more = [f"Und {len(rows) - 4} weitere, siehe Liste."] if len(rows) > 4 else []  # long briefings cost characters
+    return " ".join([head, *(p + "." for p in parts), *more])
+
+
+def window(h, m, mins):
+    """(start, end) of the daily window h:m + mins that is running now (start clipped to now) or comes next."""
+    for day in (-1, 0, 1):
+        start = (now + dt.timedelta(days=day)).replace(hour=h, minute=m)
+        end = start + dt.timedelta(minutes=mins)
+        if end > now: return max(start, now), end
+    raise AssertionError("a daily window always comes back within a day")
+
+
+def phone_sections(items, g):
+    """[(key, kind, start, end, rows)] for the next ~30h: the scheduled work blocks plus sport and the stop."""
+    timeline, overflow = schedule(items, g)
+    # the running block's own items come first, rush work right after them (that is what schedule() promised)
+    first = sum(i["mins"] for start, kind, rows in timeline if kind != "now" and start == now for i in rows)
+    out = []
+    for start, kind, rows in timeline:
+        if not rows: continue
+        if kind == "now":
+            start = now + dt.timedelta(minutes=first)
+            out.append((kind, start, start + dt.timedelta(minutes=sum(i["mins"] for i in rows)), rows))
+        else: out.append((kind, start, None, rows))
+    out.append(("sport", *window(g["sport"][0], 0, g["sport"][1] * 60), []))
+    h, m = g["stop"]
+    out.append(("stop", *window(h, m, ((5 - h) % 24) * 60 - m), []))
+    secs = []
+    for kind, start, end, rows in sorted(out, key=lambda x: x[1]):
+        if end is None:  # a work block ends where the rhythm says
+            h, n = {"prep": g["prep"], "do": g["do"]}.get(kind) or next(w for w in g["deep"] if w[0] <= start.hour < w[0] + w[1])
+            began = start.replace(hour=h, minute=0)
+            if began > start: began -= dt.timedelta(days=1)  # we are inside a block that began yesterday
+            end = began + dt.timedelta(hours=n)
+        secs.append((f"{kind}-{start:%d%H%M}", kind, start, end, rows))
+    return secs, overflow
+
+
+def phone_html(secs, overflow, g, rep=None):
+    E = html.escape
+    def ms(d): return int(d.timestamp() * 1000)
+    def item(i, at):
+        go = f'<button class="cp" data-copy="{E(i["cmd"])}">{E(i["cmd"][:24])}</button>' if i["kind"] == "task" else ""
+        sub = E((i["next"] or "")[:160])
+        due = f' · <b class="hot">fällig {E(de_when(i["due"]))}</b>' if i["due"] else ""
+        tid = f' data-tid="{E(i["id"])}"' if i["kind"] == "task" else ""
+        me = ' data-me="1"' if i.get("me") else ""
+        return (f'<label class="it"{me} data-at="{ms(at)}" data-dur="{i["mins"]}" data-t="{E(i["title"])}" data-cmd="{E(i["cmd"])}">'
+                f'<input type="checkbox" data-k="{E(i["id"] + i["title"][:24])}"{tid}><span class="t"><span class="id">{E(i["id"])}</span>'
+                f'{E(i["title"])}<div class="m">{sub}{due}</div><div class="f">📁 {E(i["where"])}</div></span>'
+                f'<span class="tm">{at:%H:%M} · {i["mins"]}m</span>{go}</label>')
+    body = []
+    for key, kind, start, end, rows in secs:
+        icon, name = BLOCK_DE[kind]
+        lis, at = [], start
+        for i in rows:
+            lis.append(item(i, at)); at += dt.timedelta(minutes=i["mins"])
+        inner = "".join(lis) or f'<div class="note">{"Keine Aufgaben, nur Bewegung." if kind == "sport" else "Laptop zu."}</div>'
+        body.append(f'<section class="{kind}" data-from="{ms(start)}" data-to="{ms(end)}" data-voice="{key}">'
+                    f'<h2>{icon} {name} <small>{E(de_when(start))}–{end:%H:%M}</small></h2><div class="blk">{inner}</div></section>')
+    if overflow:
+        lis = "".join(f'<div class="note"><b>{E(i["id"])}</b> {E(i["title"])} · fällig {E(de_when(i["due"]))} · {i["mins"]}m</div>'
+                      for i in overflow)
+        body.append(f'<section class="over"><h2>🚫 Passt nicht vor die Deadline <small>snooze, abgeben oder streichen</small></h2>'
+                    f'<div class="blk">{lis}</div></section>')
+    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Plan</title>
+<meta name="theme-color" content="#2f6f4f"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Plan"><link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="icon-180.png"><style>
+:root{{--bg:#f6f5f1;--card:#fff;--ink:#1d1d1b;--mute:#6b6a65;--line:#e3e1da;--acc:#2f6f4f;--hot:#c2410c;--sport:#3b5bdb;--night:#6d4fc2}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{--bg:#151614;--card:#1f201d;--ink:#ecebe6;--mute:#9a998f;--line:#33342f;--acc:#7cc59b;--hot:#fb923c;--sport:#91a7ff;--night:#b9a3f5}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 -apple-system,system-ui,sans-serif;-webkit-text-size-adjust:100%}}
+main{{max-width:640px;margin:auto;padding:calc(env(safe-area-inset-top) + 16px) 16px 64px}}h1{{font-size:24px;margin:0}}.sub{{color:var(--mute);font-size:14px}}
+.card{{background:var(--card);border:2px solid var(--acc);border-radius:14px;padding:14px;margin-top:16px}}.card h3{{margin:0;font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}}
+.ti{{font-size:20px;font-weight:700;line-height:1.25;margin:4px 0}}.row{{display:flex;align-items:center;justify-content:space-between;gap:10px}}.nx{{color:var(--mute);font-size:14px;margin-top:8px}}
+.say{{display:flex;gap:10px;align-items:center;width:100%;margin-top:14px;padding:14px 16px;border:0;border-radius:12px;background:var(--acc);color:#fff;font:600 17px -apple-system,system-ui,sans-serif}}
+section{{margin-top:22px}}h2{{font-size:15px;margin:0 0 8px;display:flex;justify-content:space-between;gap:8px}}h2 small{{color:var(--mute);font-weight:400;font-size:13px}}
+section.now h2::after{{content:"jetzt";font-size:12px;color:#fff;background:var(--acc);padding:2px 8px;border-radius:99px}}
+.blk{{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}}section.now .blk{{border:2px solid var(--acc)}}
+.prep .blk{{border-left:4px solid var(--night)}}.sport .blk{{border-left:4px solid var(--sport)}}.now .blk,.over .blk{{border-left:4px solid var(--hot)}}
+label.it{{display:flex;gap:12px;padding:12px 14px;border-top:1px solid var(--line);align-items:flex-start}}label.it:first-child{{border-top:0}}
+label.it input{{width:22px;height:22px;margin:1px 0 0;accent-color:var(--acc);flex:none}}input:checked+.t{{opacity:.45;text-decoration:line-through}}
+.t{{flex:1;min-width:0}}.m,.f{{color:var(--mute);font-size:13px;overflow-wrap:anywhere}}.f{{font:12px ui-monospace,monospace}}.hot{{color:var(--hot)}}
+.tm{{color:var(--mute);font-size:13px;white-space:nowrap}}.id{{font:600 12px ui-monospace,monospace;border:1px solid var(--line);border-radius:5px;padding:0 5px;margin-right:4px}}
+.note{{padding:12px 14px;color:var(--mute);font-size:14px;border-top:1px solid var(--line)}}.note:first-child{{border-top:0}}
+.cp{{flex:none;align-self:center;font:600 12px ui-monospace,monospace;border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:8px;padding:6px 8px}}.cp.ok{{background:var(--acc);color:#fff}}
+footer{{margin-top:28px;color:var(--mute);font-size:12px}}.fb{{border-color:var(--line)}}
+textarea{{width:100%;margin-top:10px;font:15px -apple-system,system-ui,sans-serif;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--bg);color:var(--ink)}}
+.say.flt{{background:var(--card);color:var(--ink);border:1px solid var(--line)}}body.me .say.flt{{background:var(--hot);color:#fff;border-color:var(--hot)}}
+body.me label.it:not([data-me]){{display:none}}body.me section[data-from]:not(.sport):not(.stop):not(:has([data-me])){{display:none}}
+.rp ul{{margin:6px 0 0;padding-left:18px;font-size:14px}}.rp .say{{background:var(--card);color:var(--ink);border:1px solid var(--line)}}
+</style></head><body><main>
+<h1>Plan · {WD[now.weekday()]} {now:%d.%m.}</h1><div class="sub">Stand {now:%H:%M} · Schluss {g["stop"][0]:02d}:{g["stop"][1]:02d}</div>
+<div class="card"><h3 id="hl">Jetzt dran</h3><div class="ti" id="ht">–</div><div class="row"><span class="tm" id="hm"></span><button class="cp" id="hg"></button></div><div class="nx" id="hn"></div></div>
+<button class="say" id="say">🔊 Was jetzt?</button>
+<button class="say flt" id="mef">👤 Nur was du selbst machen musst</button>
+{report_card(rep, g) if rep else ""}
+<div class="card fb"><h3>Feedback an tyat</h3><button class="say" id="mic">🎙 Aufnehmen</button>
+<textarea id="nt" rows="2" placeholder="oder tippen: „Sayproof ist raus“, „mloda auf Mittwoch“"></textarea>
+<div class="row"><span class="tm" id="fs"></span><button class="cp" id="ns">Senden</button></div></div>
+{"".join(body)}
+<footer><span id="ts"></span><br>Erzeugt von <code>t page --publish</code> · abhaken wird gespeichert; der Mac macht daraus <code>t done</code> (alle 2 min)</footer>
+</main><script>
+const S={{get(k){{try{{return localStorage.getItem(k)}}catch{{return null}}}},set(k,v){{try{{localStorage.setItem(k,v)}}catch{{}}}}}};
+const ts=document.getElementById("ts"),Q="plan-pending";let pend={{}};try{{pend=JSON.parse(S.get(Q)||"{{}}")}}catch{{}}
+function push(){{const ks=Object.keys(pend);if(!ks.length)return;ts.textContent="speichere "+ks.length+" …";
+  Promise.all(ks.map(k=>fetch("api/ticks/"+encodeURIComponent(k),{{method:"PUT",headers:{{"content-type":"application/json"}},body:JSON.stringify(pend[k])}})
+    .then(r=>{{if(!r.ok)throw r.status;delete pend[k]}}))).then(()=>{{ts.textContent="✓ gespeichert · "+fmt(Date.now())}})
+    .catch(e=>{{ts.textContent="✗ offline, wird nachgeholt ("+e+")"}}).finally(()=>S.set(Q,JSON.stringify(pend)))}}
+const boxes=[...document.querySelectorAll("input[data-k]")];
+boxes.forEach(c=>{{c.checked=S.get("plan-"+c.dataset.k)==="1";
+  c.addEventListener("change",()=>{{S.set("plan-"+c.dataset.k,c.checked?"1":"0");
+    pend[c.dataset.k]={{on:c.checked,tid:c.dataset.tid||"",t:c.closest("label").dataset.t}};S.set(Q,JSON.stringify(pend));push();draw()}})}});
+fetch("api/ticks").then(r=>r.ok?r.json():[]).then(l=>{{const m=Object.fromEntries(l.map(x=>[x.k,x]));
+  boxes.forEach(c=>{{const x=m[c.dataset.k];if(x&&!(c.dataset.k in pend)){{c.checked=x.on;S.set("plan-"+c.dataset.k,x.on?"1":"0")}}}});draw()}}).catch(()=>{{}});
+push();addEventListener("online",push);
+const fmt=t=>new Date(t).toTimeString().slice(0,5);
+function cur(){{const t=Date.now(),secs=[...document.querySelectorAll("section[data-from]")],a=hero();
+  const on=secs.filter(s=>t>=+s.dataset.from&&t<+s.dataset.to);
+  return (a&&on.includes(a.closest("section"))&&a.closest("section"))||on.find(s=>!s.classList.contains("stop"))||on[0]||secs.find(s=>+s.dataset.from>t)}}
+const vis=l=>!document.body.classList.contains("me")||l.dataset.me;
+const hero=()=>[...document.querySelectorAll("label.it")].find(l=>vis(l)&&!l.querySelector("input").checked);
+const mef=document.getElementById("mef"),nme=document.querySelectorAll("label.it[data-me]").length;
+mef.onclick=()=>{{S.set("plan-me",document.body.classList.contains("me")?"0":"1");draw()}};
+const [hl,ht,hm,hn]=["hl","ht","hm","hn"].map(i=>document.getElementById(i)),say=document.getElementById("say");
+function draw(){{const t=Date.now();document.querySelectorAll("section[data-from]").forEach(s=>s.classList.toggle("now",t>=+s.dataset.from&&t<+s.dataset.to));
+  const pm=S.get("plan-me");document.body.classList.toggle("me",pm===null?!!document.querySelector("section.do.now"):pm==="1");  // default: on in the do block
+  const left=[...document.querySelectorAll("label.it[data-me]")].filter(l=>!l.querySelector("input").checked).length;
+  mef.textContent=document.body.classList.contains("me")?"👤 "+left+" von "+nme+" offen · alle zeigen":"👤 Nur was du selbst machen musst ("+left+")";
+  const open=[...document.querySelectorAll("label.it")].filter(l=>vis(l)&&!l.querySelector("input").checked);  // overdue stays until ticked
+  const a=open[0],b=open[1],g=document.getElementById("hg");
+  if(!a){{hl.textContent="Fertig";ht.textContent="Alles abgehakt · Handoff + t next";hm.textContent="";g.style.display="none";hn.textContent="";return}}
+  hl.textContent=+a.dataset.at>t?"Als Nächstes · ab "+fmt(+a.dataset.at):+a.dataset.at+a.dataset.dur*6e4<t?"Überfällig · noch offen":"Jetzt dran";ht.textContent=a.dataset.t;
+  hm.textContent=fmt(+a.dataset.at)+" · "+a.dataset.dur+" min";g.textContent=g.dataset.copy=a.dataset.cmd;g.style.display="";
+  hn.textContent=b?"Danach: "+b.dataset.t+" ("+fmt(+b.dataset.at)+")":""}}
+function copy(txt,el){{const ok=()=>{{el.classList.add("ok");setTimeout(()=>el.classList.remove("ok"),1200)}};
+  (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(ok).catch(()=>prompt("kopieren",txt))}}
+document.addEventListener("click",e=>{{const b=e.target.closest("[data-copy]");if(b){{e.preventDefault();copy(b.dataset.copy,b)}}}});
+function send(body,type){{const fs=document.getElementById("fs");fs.textContent="sende …";
+  return fetch("api/inbox",{{method:"POST",body,headers:{{"content-type":type}}}}).then(r=>{{if(!r.ok)throw r.status;fs.textContent="✓ angekommen · "+fmt(Date.now())}})
+  .catch(e=>{{fs.textContent="✗ nicht gesendet ("+e+"), nochmal versuchen";throw e}})}}
+let rec;const mic=document.getElementById("mic");
+mic.onclick=()=>{{if(rec&&rec.state==="recording"){{rec.stop();return}}
+  navigator.mediaDevices.getUserMedia({{audio:true}}).then(st=>{{const ch=[];rec=new MediaRecorder(st);rec.ondataavailable=e=>ch.push(e.data);
+    rec.onstop=()=>{{st.getTracks().forEach(t=>t.stop());mic.textContent="🎙 Aufnehmen";const b=new Blob(ch,{{type:rec.mimeType||"audio/mp4"}});send(b,b.type).catch(()=>{{}})}};
+    rec.start();mic.textContent="⏹ Stopp & senden"}}).catch(()=>{{document.getElementById("fs").textContent="kein Mikrofon-Zugriff"}})}};
+document.getElementById("ns").onclick=()=>{{const t=document.getElementById("nt");if(t.value.trim())send(t.value.trim(),"text/plain;charset=utf-8").then(()=>t.value="",()=>{{}})}};
+let au;say.onclick=()=>{{const s=cur();if(!s)return;au&&au.pause();au=new Audio("voice/"+s.dataset.voice+".mp3");au.play().catch(()=>{{}})}};
+draw();setInterval(draw,60000);
+if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{{}});
+</script></body></html>"""
+
+
+def report_card(r, g):
+    E = html.escape
+    lis = "".join(f"<li>✓ {E(t.text)}</li>" for t in r["done"]) + "".join(f'<li class="hot">⚠ {E(t.text)}</li>' for t in r["late"][:5])
+    return (f'<div class="card rp"><h3>Tagesbericht seit 05:00</h3><div class="ti">{len(r["done"])} erledigt · '
+            f'{len(r["late"])} überfällig</div><div class="tm">{r["prompts"]} Prompts · {r["after_stop"]} nach '
+            f'{g["stop"][0]:02d}:{g["stop"][1]:02d}</div><ul>{lis}</ul>'
+            f'<button class="say" onclick="new Audio(\'voice/report.mp3\').play().catch(()=>{{}})">🔊 Bericht</button></div>')
+
+
+def eleven_key():
+    k = os.environ.get("ELEVENLABS_API_KEY", "")
+    p = HOME / ".config/elevenlabs/key"
+    return k or (p.read_text().strip() if p.exists() else "")
+
+
+def tts(text, key):
+    import urllib.request
+    voice = os.environ.get("ELEVENLABS_VOICE", "JBFqnCBsd6RMkjVDRZzb")
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=mp3_44100_64",
+        data=json.dumps({"text": text, "model_id": "eleven_multilingual_v2",
+                         "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}).encode(),
+        headers={"xi-api-key": key, "content-type": "application/json", "accept": "audio/mpeg"})
+    with urllib.request.urlopen(req, timeout=60) as r: return r.read()
+
+
+def render_voices(texts, out, cache, say=tts):
+    """Write out/<key>.mp3 per section. Clips are cached by text hash in `cache` (outside the deployed folder),
+    so an unchanged briefing costs no ElevenLabs characters. out/ ends up holding exactly the clips of this
+    page: an old clip never plays for a changed briefing, and nothing stale stays deployed."""
+    import hashlib
+    out.mkdir(parents=True, exist_ok=True); cache.mkdir(parents=True, exist_ok=True)
+    key, spent, keep, why = None, 0, set(), "no ElevenLabs key ($ELEVENLABS_API_KEY or ~/.config/elevenlabs/key)"
+    for name, text in texts.items():
+        clip = cache / (hashlib.sha1(text.encode()).hexdigest()[:16] + ".mp3")
+        if not clip.exists():
+            key = key if key is not None else eleven_key()
+            if not key: continue
+            try: clip.write_bytes(say(text, key)); spent += len(text)
+            except OSError as e:  # quota used up (401), offline …: the page still deploys, these blocks stay silent
+                key, why = "", f"ElevenLabs failed ({e}; quota?)"; continue
+        shutil.copyfile(clip, out / f"{name}.mp3"); keep.add(f"{name}.mp3")
+    for f in out.iterdir():
+        if f.name not in keep: shutil.rmtree(f) if f.is_dir() else f.unlink()
+    if len(keep) < len(texts): print(yel(f"{why}: {len(texts) - len(keep)} blocks without voice"))
+    return spent
+
+
+def guarded(plan):
+    """Only deploy behind the key guard: a plain assets deploy would make the plan public. Checks the parsed
+    config (comments stripped), that its entry point is the worker and that the worker checks the key."""
+    try:
+        cfg = json.loads(re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m[1] or "",
+                                (plan / "wrangler.jsonc").read_text(), flags=re.S))
+        main = plan / cfg["main"]
+        worker = main.read_text()
+    except (OSError, ValueError, KeyError, TypeError): return False
+    assets = cfg.get("assets") or {}
+    return (assets.get("run_worker_first") is True and main.resolve().parent == plan.resolve()
+            and "PLAN_KEY" in worker and "401" in worker)
+
+
+def publish(items, args):
+    g = rhythm()
+    secs, overflow = phone_sections([i for i in items if not i.get("stale")], g)
+    pub = PLAN / "public"; pub.mkdir(parents=True, exist_ok=True)
+    index = pub / "index.html"
+    if index.exists() and "t page --publish" not in index.read_text(errors="ignore"):
+        index.rename(PLAN / f"index-{now:%m%d-%H%M}.html.bak")  # a hand-written page is kept, not lost
+    _, tasks = load()
+    rep = report(tasks, g)
+    index.write_text(phone_html(secs, overflow, g, rep))
+    print(f"wrote {index}  ({sum(len(s[4]) for s in secs)} items in {len(secs)} blocks)")
+    if "--no-voice" not in args:
+        texts = {k: voice_text(kind, rows, g["stop"]) for k, kind, _, _, rows in secs} | {"report": report_text(rep, g)}
+        print(f"🔊 {len(texts)} clips, {render_voices(texts, pub / 'voice', PLAN / '.voice-cache')} new ElevenLabs characters")
+    if "--no-deploy" in args: return
+    if not guarded(PLAN): sys.exit(f"not deploying: {PLAN} needs worker.js + wrangler.jsonc with run_worker_first (key guard)")
+    wr = shutil.which("wrangler")
+    subprocess.run([wr, "deploy"] if wr else ["npx", "--yes", "wrangler@4", "deploy"], cwd=PLAN, check=True)
+
+# ── daily report + feedback inbox ─────────────────────────────────────────────
+INBOX = APP / "inbox.md"  # transcribed feedback, gitignored
+
+
+def workday_start():
+    """The working day runs 05:00–05:00, so the night block belongs to the day it started in."""
+    d = (now - dt.timedelta(hours=5)).date()
+    return dt.datetime(d.year, d.month, d.day, 5, 0)
+
+
+def prompts_since(start):
+    counts = [0] * 24
+    try:
+        with HIST.open(errors="ignore") as f:
+            for line in f:
+                m = re.search(r'"timestamp":\s*(\d+)', line)
+                if m and int(m[1]) >= start.timestamp() * 1000: counts[dt.datetime.fromtimestamp(int(m[1]) / 1000).hour] += 1
+    except OSError: pass
+    return counts
+
+
+def report(tasks, g):
+    start = workday_start()
+    done = [t for t in tasks if t.done and t.f.get("done", "") >= start.isoformat(timespec="minutes")]
+    late = [t for t in tasks if not t.done and t.due and t.due <= now]
+    soon = [t for t in tasks if not t.done and t.due and now < t.due <= now + dt.timedelta(hours=24)]
+    counts = prompts_since(start)
+    return {"start": start, "done": done, "late": late, "soon": soon, "prompts": sum(counts),
+            "after_stop": sum(c for h, c in enumerate(counts) if after_stop(h, g["stop"]))}
+
+
+def report_text(r, g):
+    def names(ts): return ", ".join(speakable(t.text) for t in ts[:3]) + (f" und {len(ts) - 3} weitere" if len(ts) > 3 else "")
+    out = [f"Tagesbericht. Erledigt: {len(r['done'])}" + (f", nämlich {names(r['done'])}." if r["done"] else ". Noch nichts abgehakt.")]
+    if r["late"]: out.append(f"Überfällig: {len(r['late'])}, zuerst {names(r['late'][:1])}. Erledigen oder mit t snooze verschieben.")
+    if r["soon"]: out.append(f"In den nächsten 24 Stunden fällig: {len(r['soon'])}.")
+    if r["after_stop"]: out.append(f"{r['after_stop']} von {r['prompts']} Prompts lagen nach {g['stop'][0]} Uhr {g['stop'][1] or ''}.".replace(" .", "."))
+    return " ".join(out)
+
+
+def report_cmd():
+    _, tasks = load()
+    g = rhythm()
+    r = report(tasks, g)
+    print(bold(f"📊 {r['start']:%a %d.%m.} seit 05:00") + dim(f"  · {r['prompts']} prompts, {r['after_stop']} after stop"))
+    for title, ts, c in (("✓ erledigt", r["done"], grn), ("⚠ überfällig", r["late"], red), ("⏰ fällig ≤24h", r["soon"], yel)):
+        print(c(f"{title} ({len(ts)})"))
+        for t in ts: print(f"   [{t.id}] {t.text}")
+    print(dim(report_text(r, g)))
+
+
+def plan_api(method, path, data=None, ctype=None):  # a 404 returns None
+    """Call the plan Worker's inbox API with the page key (URL from $TYAT_PLAN_URL or ./.plan-url)."""
+    import urllib.error
+    import urllib.request
+    url = os.environ.get("TYAT_PLAN_URL") or ((APP / ".plan-url").read_text().strip() if (APP / ".plan-url").exists() else "")
+    key = (APP / ".plan-key").read_text().strip() if (APP / ".plan-key").exists() else ""
+    if not url or not key: sys.exit("t inbox needs the plan URL ($TYAT_PLAN_URL or .plan-url) and .plan-key")
+    req = urllib.request.Request(f"{url.rstrip('/')}{path}?k={key}", data=data, method=method,
+                                 headers={"user-agent": f"tyat/{__version__}", **({"content-type": ctype} if ctype else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r: return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404: return None
+        sys.exit(f"plan inbox: {method} {path} failed ({e})")
+    except OSError as e: sys.exit(f"plan inbox: {method} {path} failed ({e})")  # HTTPError/URLError, never the key
+
+
+def transcribe(audio, ctype, key):
+    """ElevenLabs speech-to-text (multipart upload, stdlib only)."""
+    import urllib.request
+    ext = {"audio/mp4": "m4a", "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/wav": "wav"}.get(ctype, "bin")
+    b = uuid.uuid4().hex
+    body = (f'--{b}\r\nContent-Disposition: form-data; name="model_id"\r\n\r\n'
+            f'{os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")}\r\n'
+            f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="memo.{ext}"\r\nContent-Type: {ctype}\r\n\r\n').encode()
+    body += audio + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request("https://api.elevenlabs.io/v1/speech-to-text", data=body,
+                                 headers={"xi-api-key": key, "content-type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(req, timeout=120) as r: return json.loads(r.read())["text"].strip()
+
+
+def inbox_cmd(args):
+    """Fetch feedback from the phone page, transcribe voice memos, append to inbox.md, delete it remotely.
+    --claude hands the new notes to a Claude Code session that proposes t done/next/snooze/add."""
+    new = []
+    for m in json.loads(plan_api("GET", "/api/inbox")):
+        when = dt.datetime.fromtimestamp(int(m["id"].split("-")[0]) / 1000)
+        raw, ctype = plan_api("GET", f"/api/inbox/{m['id']}"), m.get("type", "")
+        if raw is None: continue  # already fetched: KV listings lag deletes by up to a minute
+        if ctype.startswith("text/"): text = raw.decode(errors="replace").strip()
+        else:
+            key = eleven_key()
+            if not key: print(yel(f"{m['id']}: no ElevenLabs key, voice memo left in the inbox")); continue
+            try: text = transcribe(raw, ctype, key)
+            except OSError as e: print(red(f"{m['id']}: transcription failed ({e}), left in the inbox")); continue
+        with INBOX.open("a") as f: f.write(f"\n## {when:%Y-%m-%d %H:%M} · {'🎙' if ctype.startswith('audio') else '✍️'}\n{text}\n")
+        plan_api("DELETE", f"/api/inbox/{m['id']}")
+        new.append((when, text))
+    if not new: return print(dim("inbox empty"))
+    for when, text in new: print(f"{bold(f'{when:%a %H:%M}')}  {text}")
+    print(dim(f"→ appended to {INBOX}"))
+    if "--claude" in args:
+        notes = "\n".join(f"- {w:%a %H:%M}: {t}" for w, t in new)
+        prompt = (f"Feedback von Marty vom Handy (Sprachnotizen/Notizen):\n{notes}\n\nLies tasks.md und schlag passende "
+                  "t done / t next / t snooze / t add vor (Skill delegating-to-tyat). Erst zeigen, dann nach OK ausführen.")
+        launch(APP, "claude", ["claude", prompt])
+
+
+def ticks_sync(quiet=False):
+    """Phone ticks → tasks.md. A ticked task is marked done (and the tick flagged applied, so the page keeps
+    showing it ticked); unticking a task the phone finished reopens it. Calendar rows are only kept in sync
+    between devices. Returns the lines it changed."""
+    st = state(); by_phone = st.setdefault("phone_done", {})
+    head, tasks = load(); changed, out = False, []
+    for x in json.loads(plan_api("GET", "/api/ticks") or b"[]"):
+        tid = x.get("tid")
+        if not tid: continue
+        t = next((t for t in tasks if t.id == tid and (not t.done or by_phone.get(tid) == t.f.get("done"))), None)
+        if not t: continue
+        if x.get("on") and not t.done:
+            t.done = True; t.f["done"] = now.isoformat(timespec="minutes"); by_phone[tid] = t.f["done"]
+            out.append(f"✓ [{tid}] {t.text}  {dim('(ticked on the phone)')}"); changed = True
+        elif not x.get("on") and t.done:
+            t.done = False; t.f.pop("done", None); by_phone.pop(tid, None)
+            out.append(f"↺ [{tid}] {t.text}  {dim('(unticked on the phone, reopened)')}"); changed = True
+        else: continue
+        if x.get("on"):
+            plan_api("PUT", f"/api/ticks/{urllib.parse.quote(x['k'], safe='')}",
+                     json.dumps({"on": True, "tid": tid, "t": x.get("t", ""), "applied": True}).encode(), "application/json")
+    if changed:
+        shutil.copy(TASKS, TASKS.with_name(TASKS.name + ".bak-ticks")); save(head, tasks); STATE.write_text(json.dumps(st, indent=1))
+    for line in out: print(line)
+    if not out and not quiet: print(dim("no new ticks"))
+    return out
+
+
+def me_cmd(args):
+    """t me: open steps only you can do, by due date. t me <id> 1|0 overrides the guess."""
+    head, tasks = load()
+    if args:
+        if len(args) != 2 or args[1] not in ("0", "1"): sys.exit("usage: t me [<id> 1|0]")
+        t = find(tasks, args[0]); t.f["me"] = args[1]; save(head, tasks)
+        return print(f"{'👤' if args[1] == '1' else '🤖'} [{t.id}] {t.text}")
+    mine = sorted((t for t in tasks if not t.done and needs_me(t)), key=lambda t: t.due or dt.datetime.max)
+    print(bold(f"👤 Needs you ({len(mine)})") + dim("  · agents prepare these, only you can finish them"))
+    for t in mine: print(f"  {pad(bold(t.id), 3, True)}  {pad(fmt_due(t.due), 10)} {t.text[:70]}")
+
+
+def fzf(lines, query="", prompt="› "):
+    if not shutil.which("fzf"): sys.exit("needs fzf (brew install fzf)")
+    r = subprocess.run(["fzf", "--ansi", "--reverse", "--height=60%", "--delimiter=\t", "--with-nth=2..",
+                        "--select-1", "--exit-0", "--prompt", prompt, "--query", query],
+                       input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+    return r.stdout.strip().split("\t", 1)[0] if r.returncode == 0 and r.stdout.strip() else None
+
+
+def project_dirs():
+    seen, out = set(), []
+    nowts = dt.datetime.now().timestamp()
+    for h in history():
+        p = h["cwd"]
+        if p not in seen and p.startswith(str(ROOT)) and Path(p).is_dir():
+            seen.add(p); out.append((p, ago(nowts - h["ts"])))
+    for g in sorted(ROOT.glob("*/.git")) + sorted(ROOT.glob("*/*/.git")) + sorted(ROOT.glob("*/*/*/.git")):
+        p = str(g.parent)
+        if p not in seen and "/_archive" not in p:
+            seen.add(p); out.append((p, ""))
+    return out
+
+
+def open_cmd(query):
+    dirs = project_dirs()
+    pick = fzf([f"{p}\t{pad(dim(a), 6)} {short(p)}" for p, a in dirs], " ".join(query), "folder › ")
+    if not pick: return
+    folder = Path(pick)
+    via, resume = choose(folder, folder.name)
+    if via is None: return
+    argv, _ = build_argv(via, None, folder.name, resume)
+    launch(folder, via, argv)
+
+
+def recent_cmd(query):
+    ss = ordered_sessions()
+    live = {s["sid"]: i for i, s in enumerate(ss, 1) if s["sid"]}
+    nowts = dt.datetime.now().timestamp()
+    rows = [h for h in history()[:80] if h["sid"] in live or session_exists(h["sid"])]
+    lines = [f"{h['sid']}\t{pad(dim(ago(nowts - h['ts'])), 6)} {grn('● ') if h['sid'] in live else '  '}"
+             f"{pad(short(h['cwd'])[:34], 34)}  {h['last'][:80]}" for h in rows]
+    sid = fzf(lines, " ".join(query), "resume › ")
+    if not sid: return
+    if sid in live: return jump(ss, live[sid])
+    h = next(h for h in rows if h["sid"] == sid)
+    if not Path(h["cwd"]).is_dir(): sys.exit(f"folder gone: {h['cwd']}")
+    launch(Path(h["cwd"]), "claude", ["claude", "--resume", sid])
+
+
+def session_exists(sid):
+    return any((HOME / ".claude/projects").glob(f"*/{sid}.jsonl"))
+
+
+# ── check: a small model reads the evidence, rules do the rescheduling ───────
+# The model only answers "is this task done?" from what happened in its folder. Times are never its job:
+# late tasks get the slot schedule() gives them in the coming blocks.
+CHECK_HOURS = int(os.environ.get("TYAT_CHECK_HOURS", 72))      # how far back evidence counts
+CHECK_MIN = float(os.environ.get("TYAT_CHECK_MIN", 0.85))      # confidence needed to mark a task done
+CHECK_CACHE = APP / ".check.json"                               # evidence hash + last verdict per task
+CHECK_LOG = APP / ".check.log"                                  # every change --apply made, for undoing by hand
+PROJECTS = HOME / ".claude" / "projects"
+
+
+def git_log(d, since):
+    try:
+        r = subprocess.run(["git", "-C", str(d), "log", f"--since={since:%Y-%m-%dT%H:%M}", "-n", "6", "--format=%ad %s",
+                            "--date=format:%d.%m %H:%M", "--", "."], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired): return []
+    return r.stdout.strip().splitlines() if r.returncode == 0 else []
+
+
+def touched(d, since, limit=5):
+    """Newest files changed in d (3 levels deep) since `since`; the task file itself never counts."""
+    cut, out = since.timestamp(), []
+    for dirpath, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")]
+        if len(Path(dirpath).relative_to(d).parts) >= 2: dirs[:] = []
+        for f in files:
+            p = Path(dirpath) / f
+            if p in (TASKS, INBOX) or f.startswith("."): continue
+            try: m = p.stat().st_mtime
+            except OSError: continue
+            if m >= cut: out.append((m, p))
+    return [f"{dt.datetime.fromtimestamp(m):%d.%m %H:%M} {p.relative_to(d)}" for m, p in sorted(out, reverse=True)[:limit]]
+
+
+def transcript_tail(path, n=4, width=400):
+    """Last n user/assistant text messages of a Claude Code transcript (reads only its last 400 kB)."""
+    msgs = []
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, path.stat().st_size - 400_000))
+            lines = f.read().decode(errors="ignore").splitlines()[1:]
+    except OSError: return []
+    for line in lines:
+        try: m = json.loads(line)
+        except ValueError: continue
+        if m.get("type") not in ("user", "assistant") or m.get("isMeta"): continue
+        c = m.get("message", {}).get("content")
+        texts = [c] if isinstance(c, str) else [x.get("text", "") for x in c or [] if isinstance(x, dict) and x.get("type") == "text"]
+        for t in texts:
+            t = t.strip()
+            if t and not t.startswith("<"): msgs.append(f"{m['type']}: {' '.join(t.split())[-width:]}")
+    return msgs[-n:]
+
+
+def transcripts(t, d, since):
+    """The task's own session plus the newest conversation in its folder, if they moved since `since`."""
+    out = []
+    if sid := t.f.get("sid"): out += list(PROJECTS.glob(f"*/{sid}.jsonl"))
+    slug = PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(d))
+    if slug.is_dir():
+        newest = max(slug.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, default=None)
+        if newest and newest not in out: out.append(newest)
+    return [p for p in out if p.stat().st_mtime >= since.timestamp()]
+
+
+def evidence(t, since, latest, cache):
+    """What happened in the task's folder since `since`, as prompt lines ([] = nothing to judge)."""
+    d = resolve_dir(t.f.get("at"))
+    if not d or d == ROOT or not d.is_dir(): return []
+    if d not in cache:
+        ev = [f"commit {c}" for c in git_log(d, since)] + [f"file {f}" for f in touched(d, since)]
+        cache[d] = ev
+    ev = list(cache[d])
+    hp = task_handoff(t, latest)
+    if hp and hp[0] >= since.timestamp():
+        title, step = handoff_summary(hp[1])
+        ev.append(f"handoff {dt.datetime.fromtimestamp(hp[0]):%d.%m %H:%M} {title} → next: {step}")
+    for p in transcripts(t, d, since):
+        ev += [f"session {dt.datetime.fromtimestamp(p.stat().st_mtime):%d.%m %H:%M} {m}" for m in transcript_tail(p)]
+    return ev
+
+
+def inbox_recent(since):
+    """Phone notes (t inbox) written since `since`."""
+    if not INBOX.exists(): return []
+    out = []
+    for block in INBOX.read_text(errors="ignore").split("\n## ")[1:]:
+        head, _, body = block.partition("\n")
+        try: when = dt.datetime.strptime(head[:16], "%Y-%m-%d %H:%M")
+        except ValueError: continue
+        if when >= since: out.append(f"{when:%d.%m %H:%M} {' '.join(body.split())}")
+    return out
+
+
+def check_prompt(rows, notes):
+    lines = ["You check a to-do list against evidence of recent work. For each task decide:",
+             "done = the evidence shows the task's OUTCOME is reached (sent, posted, submitted, merged, ordered, finished).",
+             "progress = work happened for this task but the outcome is not reached yet (a draft is not 'sent').",
+             "none = the evidence is about something else. Several tasks share a folder: judge only evidence that matches this task.",
+             'Answer with JSON only: {"tasks": [{"id": "...", "verdict": "done|progress|none", "confidence": 0.0-1.0,',
+             '"why": "max 15 words, cite the evidence", "next": "next concrete step if progress, else empty"}]}',
+             f"Now: {now:%a %d.%m.%Y %H:%M}."]
+    if notes: lines += ["", "Notes Martin sent from his phone (apply to any task):"] + [f"- {n}" for n in notes]
+    for t, ev in rows:
+        lines += ["", f"### [{t.id}] {t.text}", f"due: {t.f.get('due', '-')} · folder: {t.f.get('at', '-')}"]
+        if t.next: lines.append(f"current next step: {t.next}")
+        lines += ["evidence:"] + [f"- {e}" for e in ev or ["(only the phone notes above)"]]
+    return "\n".join(lines)
+
+
+def slm(prompt, timeout=180):
+    """Ask the small model. TYAT_SLM=claude:haiku (default, headless Claude Code, no hooks/MCP/tools)
+    or ollama:<model> (local, http://localhost:11434). Returns the raw text answer."""
+    kind, _, model = os.environ.get("TYAT_SLM", "claude:haiku").partition(":")
+    if kind == "ollama":
+        import urllib.request
+        body = json.dumps({"model": model, "prompt": prompt, "stream": False, "format": "json", "options": {"temperature": 0}}).encode()
+        req = urllib.request.Request("http://localhost:11434/api/generate", data=body, headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r: return json.loads(r.read())["response"]
+    exe = shutil.which("claude") or str(HOME / ".local/bin/claude")
+    r = subprocess.run([exe, "-p", "--model", model or "haiku", "--no-session-persistence", "--setting-sources", "",
+                        "--strict-mcp-config", "--tools", ""], input=prompt, capture_output=True, text=True,
+                       timeout=timeout, cwd=str(Path(os.environ.get("TMPDIR", "/tmp"))))
+    if r.returncode: raise OSError(f"claude -p failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return r.stdout
+
+
+def parse_verdicts(text):
+    """{id: verdict dict} from the model's answer; tolerates code fences and chatter around the JSON."""
+    a, b = text.find("{"), text.rfind("}")
+    try: data = json.loads(text[a:b + 1]) if a >= 0 else {}
+    except ValueError: return {}
+    rows = data.get("tasks", []) if isinstance(data, dict) else []
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict) or r.get("verdict") not in ("done", "progress", "none"): continue
+        try: conf = max(0.0, min(1.0, float(r.get("confidence", 0))))
+        except (TypeError, ValueError): conf = 0.0
+        out[str(r.get("id"))] = {"verdict": r["verdict"], "confidence": conf, "why": str(r.get("why", ""))[:160],
+                                 "next": str(r.get("next", ""))[:160]}
+    return out
+
+
+def replan(tasks, g, keep=()):
+    """{id: new due} for every late open task: its slot in the blocks of the next 3 days (rules, no model).
+    Late tasks that find no room keep their date and come back as 'no room'."""
+    pinned = {t.id for t in tasks if fixed(t)}  # appointments: nobody moves them, a missed one is a question
+    items = [i for i in page_items([t for t in tasks if t.id not in keep], handoff_map()) if not i.get("stale")]
+    late = {t.id for t in tasks if not t.done and t.due and t.due <= now and t.id not in keep and t.id not in pinned}
+    by = {t.id: t for t in tasks}
+    blocks, _ = schedule(items, g, horizon=72)
+    moves = {}
+    for start, _kind, its in blocks:
+        at = start
+        for i in its:
+            slot = at + dt.timedelta(minutes=-at.minute % 5)
+            if i["kind"] == "task" and i["id"] in late and not (deadline(by[i["id"]]) and slot > deadline(by[i["id"]])):
+                moves[i["id"]] = slot
+            at += dt.timedelta(minutes=i["mins"])
+    return moves, sorted(late - set(moves))
+
+
+def missed(tasks, keep=()):
+    """Fixed appointments whose time has passed: ask whether they happened, never reschedule them."""
+    return [t.id for t in tasks if not t.done and fixed(t) and t.due and t.due <= now and t.id not in keep]
+
+
+def check(tasks, ask=None, since=None):
+    """Verdicts for open tasks with fresh evidence; unchanged evidence reuses the cached verdict.
+    Returns ({id: verdict}, asked count)."""
+    since = since or now - dt.timedelta(hours=CHECK_HOURS)
+    try: cache = json.loads(CHECK_CACHE.read_text())
+    except (OSError, ValueError): cache = {}
+    notes, latest, dirs = inbox_recent(since), handoff_map(), {}
+    rows, verdicts = [], {}
+    for t in tasks:
+        if t.done: continue
+        ev = evidence(t, since, latest, dirs)
+        if not ev and not notes: continue
+        h = hashlib.sha1("\n".join([t.text, *notes, *ev]).encode()).hexdigest()
+        if cache.get(t.id, {}).get("h") == h: verdicts[t.id] = cache[t.id]["v"]
+        else: rows.append((t, ev, h))
+    if rows:
+        got = parse_verdicts((ask or slm)(check_prompt([(t, ev) for t, ev, _ in rows], notes)))
+        for t, _, h in rows:
+            if t.id in got: verdicts[t.id] = got[t.id]; cache[t.id] = {"h": h, "v": got[t.id]}
+    open_ids = {t.id for t in tasks if not t.done}
+    CHECK_CACHE.write_text(json.dumps({k: v for k, v in cache.items() if k in open_ids}, indent=1))
+    return verdicts, len(rows)
+
+
+def check_cmd(args):
+    """t check [--apply] [--auto]: --apply marks confident 'done' verdicts and moves late tasks into free slots;
+    --auto = --apply + a notification instead of output (run by the notifier at block starts)."""
+    auto = "--auto" in args
+    apply = auto or "--apply" in args
+    head, tasks = load()
+    try: verdicts, asked = check(tasks)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if auto: return notify("🌱 tyat · check failed", str(e)[:120])
+        sys.exit(f"t check: model call failed ({e})")
+    by_id = {t.id: t for t in tasks if not t.done}
+    done = [i for i, v in verdicts.items() if v["verdict"] == "done" and v["confidence"] >= CHECK_MIN and i in by_id]
+    ask = [i for i in done if needs_me(by_id[i])] if auto else []  # ask first: only Marty closes his own steps
+    done = [i for i in done if i not in ask]
+    moves, stuck = replan(tasks, rhythm(), keep=done)
+    gone = missed(tasks, keep=done)
+    log = []
+    if not auto:
+        print(bold("🔍 CHECK") + dim(f"  ({os.environ.get('TYAT_SLM', 'claude:haiku')} · {len(verdicts)} tasks with activity, "
+                                    f"{asked} re-asked, last {CHECK_HOURS}h)"))
+        for i, v in sorted(verdicts.items(), key=lambda kv: ({"done": 0, "progress": 1}.get(kv[1]["verdict"], 2), kv[0])):
+            if i not in by_id or v["verdict"] == "none": continue
+            mark = grn("✓ done    ") if i in done else yel("? done    ") if v["verdict"] == "done" else cyan("… progress")
+            info = f"{v['confidence']:.2f} · {v['why']}"
+            print(f"  {mark} [{i}] {by_id[i].text[:60]}  {dim(info)}")
+            if v["verdict"] == "progress" and v["next"]: print(f"               {dim('→ ' + v['next'])}")
+        for i, d in sorted(moves.items(), key=lambda kv: kv[1]):
+            print(f"  {cyan('↻ move    ')} [{i}] {by_id[i].text[:60]}  {dim(fmt_due(by_id[i].due) + ' → ')}{fmt_due(d)}")
+        for i in stuck: print(f"  {red('⚠ no room ')} [{i}] {by_id[i].text[:60]}  {dim('cut, delegate or snooze by hand')}")
+        for i in gone: print(f"  {yel('? missed  ')} [{i}] {by_id[i].text[:60]}  {dim('appointment passed: did it happen? t done / t snooze')}")
+        if not apply and (done or moves): print(dim("  t check --apply  marks the ✓ and makes the ↻ moves"))
+    if apply:
+        for i in done:
+            t = by_id[i]; t.done = True; t.f["done"] = now.isoformat(timespec="minutes")
+            t.notes.append(f"auto-check: {verdicts[i]['why']}"); log.append(f"done [{i}] {t.text} — {verdicts[i]['why']}")
+        for i, d in moves.items():
+            log.append(f"move [{i}] {by_id[i].f.get('due')} → {d.isoformat(timespec='minutes')}")
+            by_id[i].f["due"] = d.isoformat(timespec="minutes")
+        if log:
+            save(head, tasks)
+            with CHECK_LOG.open("a") as f: f.write("".join(f"{now:%Y-%m-%d %H:%M} {x}\n" for x in log))
+        if auto and ask:
+            notify(f"🌱 tyat · erledigt? {len(ask)}", " · ".join(f"[{i}] {by_id[i].text[:40]}" for i in ask)[:180] + " → abhaken")
+        if auto and (done or moves or stuck):
+            notify(f"🌱 tyat · check: {len(done)} done, {len(moves)} moved" + (f", {len(stuck)} no room" if stuck else ""),
+                   " · ".join([f"✓{i}" for i in done] + [f"↻{i} {fmt_due(d)}" for i, d in moves.items()])[:180])
+        elif not auto: print(grn(f"  applied: {len(done)} done, {len(moves)} moved") + dim(f"  (log: {CHECK_LOG})"))
+
+
+def notify(title, msg):
+    msg, title = msg.replace('"', "'"), title.replace('"', "'")
+    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}" sound name "Glass"'])
+
+
+def notify_pass():
+    st = state()
+    seen = st.setdefault("seen", {})
+    _, tasks = load()
+    for t in tasks:
+        if t.done or not t.due or t.due > now: continue
+        key = f"task:{t.id}:{t.f['due']}"
+        if key not in seen:
+            notify(f"🌱 tyat · ⏰ [{t.id}] due", f"{t.text} — {t.f.get('at', '')}  ·  t go {t.id}")
+            seen[key] = now.isoformat()
+    for s in sessions():
+        if s["status"] in ON_YOU and s["since"] >= WAIT_ALERT_MIN * 60:
+            key = f"sess:{s['sid']}:{s['status']}:{s['changed']}"
+            if key not in seen:
+                notify(f"🌱 tyat · ⏳ {s['who']} {ON_YOU[s['status']]} · {ago(s['since'])}", short(s["cwd"]))
+                seen[key] = now.isoformat()
+    g = rhythm()
+    for key, (h, m), title, msg in (("sport", (g["sport"][0], 0), "🏃 Sport time", "Laptop zu. Tasks warten, der Block nicht."),
+                                    ("stop", g["stop"], "🌙 Schluss für heute", "Handoff schreiben, t next setzen, schlafen.")):
+        at = now.replace(hour=h, minute=m)
+        k = f"{key}:{now:%Y-%m-%d}"
+        if at <= now < at + dt.timedelta(minutes=15) and k not in seen:
+            notify(f"🌱 tyat · {title}", msg); seen[k] = now.isoformat()
+    if os.environ.get("TYAT_AUTOCHECK", "0") == "1":  # opt-in until replan() respects appointments + business hours
+        for key, (h, m) in (("prep", (g["prep"][0], 0)), ("do", (g["do"][0], 0)), ("stop", g["stop"])):
+            at, k = now.replace(hour=h, minute=m), f"check-{key}:{now:%Y-%m-%d}"
+            if at <= now < at + dt.timedelta(minutes=15) and k not in seen:
+                with (APP / ".notify.log").open("a") as err:
+                    subprocess.Popen([sys.executable, str(APP / "tyat"), "check", "--auto"], stdout=subprocess.DEVNULL,
+                                     stderr=err, start_new_session=True)
+                seen[k] = now.isoformat()
+    if (APP / ".plan-key").exists() and os.environ.get("TYAT_TICKSYNC", "1") == "1":
+        try:
+            for line in ticks_sync(quiet=True): notify("🌱 tyat · vom Handy", re.sub(r"\x1b\[[0-9;]*m", "", line))
+        except SystemExit as e: print(f"tick sync: {e}", file=sys.stderr)  # offline: next pass retries
+        st = state() | {"seen": seen}
+    cutoff = (now - dt.timedelta(days=3)).isoformat()
+    st["seen"] = {k: v for k, v in seen.items() if v >= cutoff}
+    STATE.write_text(json.dumps(st, indent=1))
+
+
+LABEL = "dev.tyat.notify"
+PLIST = HOME / f"Library/LaunchAgents/{LABEL}.plist"
+OLD_PLISTS = [HOME / "Library/LaunchAgents/de.marty.t-notify.plist", HOME / "Library/LaunchAgents/dev.tend.notify.plist"]
+
+
+def install():
+    for name in ("tyat", "t"):
+        link = HOME / ".local/bin" / name
+        if link.is_symlink() or not link.exists():
+            if link.is_symlink(): link.unlink()
+            link.symlink_to(APP / "tyat"); print(f"linked {link} → {APP / 'tyat'}")
+        else: print(f"{link} exists and is not a symlink — left alone")
+    PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array><string>{sys.executable}</string><string>{APP / 'tyat'}</string><string>notify</string></array>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>{APP / '.notify.log'}</string>
+</dict></plist>
+""")
+    for old in OLD_PLISTS + [PLIST]:
+        if old.exists():
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(old)], capture_output=True)
+            if old != PLIST: old.unlink()
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)], check=True)
+    print(f"notifier loaded: {PLIST} (every 2 min; uninstall: launchctl bootout gui/{os.getuid()} {PLIST})")
+
+
+# ── cli ───────────────────────────────────────────────────────────────────────
+COMMANDS = {"add", "go", "done", "next", "snooze", "rm", "edit", "notify", "install", "ls", "here", "help",
+            "now", "open", "recent", "handoffs", "page", "report", "inbox", "check", "sync", "me", "fix", "dl"}
+
+
+def main(argv):
+    if not argv: return interactive()
+    cmd, args = argv[0], argv[1:]
+    if cmd.isdigit(): return jump(ordered_sessions(), int(cmd))
+    if cmd in ("ls",): return board()
+    if cmd == "now": return now_cmd()
+    if cmd in ("open", "o"): return open_cmd(args)
+    if cmd in ("recent", "r"): return recent_cmd(args)
+    if cmd in ("handoffs", "h"): return handoffs_cmd(args)
+    if cmd in ("here", "."): return board(Path.cwd())
+    if cmd in ("help", "-h", "--help"): return print(__doc__)
+    if cmd in ("version", "-V", "--version"): return print(f"tyat {__version__}")
+    if cmd in ("page", "html"): return page_cmd(args)
+    if cmd == "report": return report_cmd()
+    if cmd == "inbox": return inbox_cmd(args)
+    if cmd == "sync": return ticks_sync()
+    if cmd == "me": return me_cmd(args)
+    if cmd == "check": return check_cmd(args)
+    if cmd == "edit": return os.execvp(os.environ.get("EDITOR", "nano"), [os.environ.get("EDITOR", "nano"), str(TASKS)])
+    if cmd == "notify": return notify_pass()
+    if cmd == "install": return install()
+    if cmd not in ("add", "go", "done", "next", "snooze", "rm", "fix", "dl"): sys.exit(f"t: unknown command '{cmd}' (t help for usage)")
+    head, tasks = load()
+    if cmd == "add":
+        at = next((a[1:] for a in args if a.startswith("@")), None)
+        pri = max((len(a) for a in args if re.fullmatch(r"!{1,3}", a)), default=0)
+        extra = dict(a.split(":", 1) for a in args if re.fullmatch(r"(est:\d+[mh]|reach:[1-5]|me:[01]|fix:[01])", a))
+        due, words = parse_when([a for a in args if not a.startswith("@") and not re.fullmatch(r"!{1,3}", a)
+                                 and not re.fullmatch(r"(est|reach|me|fix):\S+", a)])
+        if not words: sys.exit("usage: t add <text> [@folder] [when]")
+        if at is None:
+            cwd = Path.cwd()
+            at = short(cwd) if cwd != ROOT else None
+        elif at in (".", "here"): at = short(Path.cwd())
+        t = Task(False, " ".join(words))
+        t.text = " ".join(words)
+        t.f = {k: v for k, v in (("at", at), ("due", due and due.isoformat(timespec="minutes")), ("pri", pri and str(pri)), ("id", new_id(tasks))) if v} | extra
+        if at and not resolve_dir(at).is_dir(): print(yel(f"note: folder {resolve_dir(at)} does not exist yet"))
+        tasks.append(t); save(head, tasks)
+        return print(f"+ [{t.id}] {t.text}  {fmt_due(due)}  {dim('@' + at) if at else ''}")
+    if cmd == "go":
+        if not args: sys.exit("usage: t go <id> [claude|codex|kit:<name>] [--new]")
+        return go(args[0], args[1:])
+    if not args: sys.exit(f"usage: t {cmd} <id> …")
+    t = find(tasks, args[0])
+    if cmd == "done":
+        t.done = True; t.f["done"] = now.isoformat(timespec="minutes"); msg = f"✓ [{t.id}] {t.text}"
+    elif cmd == "next":
+        if not args[1:]: sys.exit("usage: t next <id> <next step>")
+        t.notes.append("next: " + " ".join(args[1:])); msg = f"→ [{t.id}] next: {' '.join(args[1:])}"
+    elif cmd == "snooze":
+        due, _ = parse_when(args[1:] or ["1h"])
+        if due is None: sys.exit(f"t: can't read a time in {' '.join(args[1:])!r} (e.g. 2h, tomorrow, fri 14:00)")
+        t.f["due"] = due.isoformat(timespec="minutes"); msg = f"💤 [{t.id}] → {fmt_due(due)}"
+        if deadline(t) and due > deadline(t): msg += red(f"  ⚠ after its deadline {fmt_due(deadline(t))}")
+    elif cmd == "fix":
+        t.f["fix"] = "0" if args[1:] == ["0"] else "1"
+        msg = f"{'📌 fixed' if t.f['fix'] == '1' else '↻ movable'} [{t.id}] {t.text}"
+    elif cmd == "dl":
+        if args[1:] == ["-"]: t.f.pop("dl", None); msg = f"[{t.id}] no deadline"
+        else:
+            d, _ = parse_when(args[1:])
+            if d is None: sys.exit("usage: t dl <id> <when> (or - to clear)")
+            t.f["dl"] = d.isoformat(timespec="minutes"); msg = f"⛳ [{t.id}] deadline {fmt_due(d)}"
+    elif cmd == "rm":
+        tasks.remove(t); msg = f"✗ [{t.id}] removed"
+    save(head, tasks)
+    print(msg)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
